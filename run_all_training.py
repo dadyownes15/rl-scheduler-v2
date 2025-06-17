@@ -2,12 +2,28 @@
 """
 Training script for all four RL algorithms on carbon-aware workload
 Runs: MaskablePPO, MaskablePPO_Carbon, MARL, MARL_Plus
+
+Cross-platform compatible (Windows, macOS, Linux)
 """
 
 import subprocess
 import sys
 import time
 import os
+import platform
+
+def get_python_executable():
+    """Get the correct Python executable for the current platform"""
+    if platform.system() == "Windows":
+        # On Windows, prefer 'python' over 'python3'
+        return "python"
+    else:
+        # On Unix-like systems, prefer 'python3' if available
+        try:
+            subprocess.run([sys.executable, "--version"], check=True, capture_output=True)
+            return sys.executable
+        except:
+            return "python3"
 
 def run_algorithm(algorithm_name, script_name, workload, epochs, backfill):
     """Run a single algorithm training"""
@@ -16,6 +32,7 @@ def run_algorithm(algorithm_name, script_name, workload, epochs, backfill):
     print(f"Workload: {workload}")
     print(f"Epochs: {epochs}")
     print(f"Backfill: {backfill}")
+    print(f"Platform: {platform.system()}")
     print(f"{'='*60}")
     
     start_time = time.time()
@@ -23,13 +40,33 @@ def run_algorithm(algorithm_name, script_name, workload, epochs, backfill):
     try:
         # Run the training script
         cmd = [
-            sys.executable, script_name,
+            get_python_executable(), script_name,
             "--workload", workload,
             "--backfill", str(backfill)
         ]
         
         print(f"Running command: {' '.join(cmd)}")
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        
+        # Platform-specific subprocess settings
+        if platform.system() == "Windows":
+            # On Windows, we need to handle the console properly
+            result = subprocess.run(
+                cmd, 
+                check=True, 
+                capture_output=True, 
+                text=True,
+                encoding='utf-8',
+                errors='replace'  # Handle any encoding issues gracefully
+            )
+        else:
+            result = subprocess.run(
+                cmd, 
+                check=True, 
+                capture_output=True, 
+                text=True,
+                encoding='utf-8',
+                errors='replace'
+            )
         
         # Print any output
         if result.stdout:
@@ -101,6 +138,46 @@ def restore_epochs_in_file(filename, original_epochs=300):
     
     print(f"✅ Restored {filename} to use {original_epochs} epochs")
 
+def check_system_requirements():
+    """Check if the system meets the requirements for training"""
+    print("Checking system requirements...")
+    
+    # Check Python version
+    python_version = sys.version_info
+    if python_version.major < 3 or (python_version.major == 3 and python_version.minor < 7):
+        print(f"❌ ERROR: Python 3.7+ required. Current version: {python_version.major}.{python_version.minor}")
+        return False
+    
+    print(f"✅ Python version: {python_version.major}.{python_version.minor}.{python_version.micro}")
+    
+    # Check platform
+    system = platform.system()
+    print(f"✅ Platform: {system} {platform.release()}")
+    
+    # Check if required modules can be imported
+    required_modules = ['torch', 'numpy', 'pandas']
+    missing_modules = []
+    
+    for module in required_modules:
+        try:
+            __import__(module)
+            print(f"✅ {module} available")
+        except ImportError:
+            missing_modules.append(module)
+            print(f"❌ {module} not found")
+    
+    if missing_modules:
+        print(f"\n❌ ERROR: Missing required modules: {', '.join(missing_modules)}")
+        print("Please install them using:")
+        if platform.system() == "Windows":
+            print(f"pip install {' '.join(missing_modules)}")
+        else:
+            print(f"pip3 install {' '.join(missing_modules)}")
+        return False
+    
+    print("✅ All system requirements met!")
+    return True
+
 def main():
     # Configuration
     workload = "lublin_256_carbon_float"
@@ -118,7 +195,13 @@ def main():
     print("="*80)
     print("CARBON-AWARE RL SCHEDULER TRAINING")
     print("="*80)
-    print(f"Workload: {workload}")
+    
+    # Check system requirements first
+    if not check_system_requirements():
+        print("\n❌ System requirements not met. Exiting...")
+        sys.exit(1)
+    
+    print(f"\nWorkload: {workload}")
     print(f"Epochs per algorithm: {epochs}")
     print(f"Backfill mode: {backfill}")
     print(f"Algorithms to train: {len(algorithms)}")
@@ -126,12 +209,15 @@ def main():
         print(f"  {i}. {name}")
     print("="*80)
     
-    # Check if workload file exists
-    workload_file = f"./data/{workload}.swf"
+    # Check if workload file exists (cross-platform path handling)
+    workload_file = os.path.join("data", f"{workload}.swf")
     if not os.path.exists(workload_file):
         print(f"❌ ERROR: Workload file not found: {workload_file}")
         print("Please make sure you have generated the carbon-aware workload first.")
-        print("Run: python create_carbon_swf.py --float --workload lublin_256")
+        if platform.system() == "Windows":
+            print("Run: python create_carbon_swf.py --float --workload lublin_256")
+        else:
+            print("Run: python3 create_carbon_swf.py --float --workload lublin_256")
         sys.exit(1)
     
     # Check if all algorithm files exist
@@ -218,13 +304,16 @@ def main():
             print(f"   - {csv_name}")
         
         print("\n2. Check the saved models in:")
-        print(f"   - {workload}/MaskablePPO/")
-        print(f"   - {workload}/MaskablePPO_Carbon/")
-        print(f"   - {workload}/MARL/")
-        print(f"   - {workload}/MARL_Plus/")
+        print(f"   - {os.path.join(workload, 'MaskablePPO')}")
+        print(f"   - {os.path.join(workload, 'MaskablePPO_Carbon')}")
+        print(f"   - {os.path.join(workload, 'MARL')}")
+        print(f"   - {os.path.join(workload, 'MARL_Plus')}")
         
         print(f"\n3. Run comparison:")
-        print(f"   python compare.py --workload {workload} --len 1024 --iter 10 --backfill {backfill}")
+        if platform.system() == "Windows":
+            print(f"   python compare.py --workload {workload} --len 1024 --iter 10 --backfill {backfill}")
+        else:
+            print(f"   python3 compare.py --workload {workload} --len 1024 --iter 10 --backfill {backfill}")
     
     elif successful > 0:
         print(f"\n⚠️ Partial success: {successful} out of {len(algorithms)} algorithms completed.")
