@@ -41,21 +41,24 @@ class Buffer():
 
 
 class CategoricalMasked(Categorical):
-    def __init__(self, probs=None, logits=None, validate_args=None, masks=[],device=None):
+    def __init__(self, probs=None, logits=None, validate_args=None, masks=[], device=None):
         self.masks = masks
         if len(self.masks) == 0:
             super(CategoricalMasked, self).__init__(probs, logits, validate_args)
         else:
             self.masks = masks.type(torch.BoolTensor).to(device)
+            # In MaskablePPO: mask=1 means VALID, mask=0 means INVALID
+            # So we need to set logits to -1e+8 where mask=0 (invalid actions)
             logits = torch.where(self.masks, logits, torch.tensor(-1e+8).to(device))
-            # print(self.masks.shape)
-            # print(logits.shape)
             super(CategoricalMasked, self).__init__(probs, logits, validate_args)
 
     def entropy(self):
         if len(self.masks) == 0:
             return super(CategoricalMasked, self).entropy()
+        # Only compute entropy over valid (unmasked) actions
         p_log_p = self.logits * self.probs
+        # Set masked entries to 0 for entropy calculation
+        p_log_p = torch.where(self.masks, p_log_p, torch.tensor(0.0).to(p_log_p.device))
         return -p_log_p.sum(-1)
 
 class ActorNet(nn.Module):
@@ -421,9 +424,9 @@ def train(workload, backfill, debug=False):
             for i in range(0, MAX_QUEUE_SIZE * JOB_FEATURES, JOB_FEATURES):
                 job_slice = o[i:i + JOB_FEATURES]
                 
-                # Check for padding patterns (mask out with 0)
-                # Pattern 1: [0, 1, 1, 1, 1, 1, 0] - job queue padding
-                padding_pattern1 = [0] + [1] * (JOB_FEATURES - 2) + [0]
+                # Check for padding patterns from HPCSimPickJobs.py line 377
+                # Pattern 1: [0, 1, 1, 1, 1, 0.5, 0] - job queue padding (7 features)
+                padding_pattern1 = [0, 1, 1, 1, 1, 0.5, 0]
                 # Pattern 2: [1, 1, 1, 1, 1, 1, 1] - all ones padding
                 padding_pattern2 = [1] * JOB_FEATURES
                 
