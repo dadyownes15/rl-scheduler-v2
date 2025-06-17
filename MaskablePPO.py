@@ -366,7 +366,7 @@ class PPO():
 
 def train(workload,backfill):
     seed = 0
-    epochs = 300
+    epochs = 60
     traj_num = 100
     env = HPCEnv(backfill=1)
     env.seed(seed)

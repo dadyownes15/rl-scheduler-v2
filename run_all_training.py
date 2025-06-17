@@ -107,15 +107,15 @@ def modify_epochs_in_file(filename, new_epochs):
     """Temporarily modify the epochs value in a training file"""
     print(f"Modifying epochs to {new_epochs} in {filename}...")
     
-    # Read the file
-    with open(filename, 'r') as f:
+    # Read the file with UTF-8 encoding
+    with open(filename, 'r', encoding='utf-8') as f:
         content = f.read()
     
     # Replace epochs = 300 with epochs = new_epochs
     modified_content = content.replace('epochs = 300', f'epochs = {new_epochs}')
     
-    # Write back to file
-    with open(filename, 'w') as f:
+    # Write back to file with UTF-8 encoding
+    with open(filename, 'w', encoding='utf-8') as f:
         f.write(modified_content)
     
     print(f"✅ Modified {filename} to use {new_epochs} epochs")
@@ -124,16 +124,16 @@ def restore_epochs_in_file(filename, original_epochs=300):
     """Restore the original epochs value in a training file"""
     print(f"Restoring epochs to {original_epochs} in {filename}...")
     
-    # Read the file
-    with open(filename, 'r') as f:
+    # Read the file with UTF-8 encoding
+    with open(filename, 'r', encoding='utf-8') as f:
         content = f.read()
     
     # Find current epochs value and replace with original
     import re
     modified_content = re.sub(r'epochs = \d+', f'epochs = {original_epochs}', content)
     
-    # Write back to file
-    with open(filename, 'w') as f:
+    # Write back to file with UTF-8 encoding
+    with open(filename, 'w', encoding='utf-8') as f:
         f.write(modified_content)
     
     print(f"✅ Restored {filename} to use {original_epochs} epochs")

@@ -62,11 +62,11 @@ class Job:
         # Carbon consideration index from the SWF file (if available)
         # If the file has 19 fields, the last one is the carbon consideration index
         if len(s_array) >= 19:
-            self.carbon_consideration = int(s_array[18])
+            self.carbon_consideration = float(s_array[18])
         else:
             # Fallback: all jobs have carbon consideration 0 (very low concern)
             # This means no carbon optimization when using original SWF files
-            self.carbon_consideration = 0
+            self.carbon_consideration = 0.0
 
         try:
             self.partition_number = int(s_array[15])
