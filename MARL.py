@@ -1,4 +1,3 @@
-
 import os
 
 import csv
@@ -396,6 +395,7 @@ class PPO():
         returns = torch.tensor(self.buffer.Returns)
         advantages = torch.tensor(self.buffer.advantages)
         advantages = self.normalize(advantages)
+
         for i in range(self.ppo_update_time):
             for index in BatchSampler(SubsetRandomSampler(range(len(self.buffer.states))), self.batch_size, False):
                 index_tensor = torch.tensor(index)
@@ -460,84 +460,251 @@ class PPO():
             ac2 = dist_bin2.sample()
 
         return ac1, ac2
-
-def train(workload,backfill):
-    seed = 0
-    epochs = 300
-    traj_num = 100
-    env = HPCEnv(backfill=backfill)
-    env.seed(seed)
-    current_dir = os.getcwd()
-    workload_name = workload
-    workload_file = os.path.join(current_dir, "./data/" + workload_name + ".swf")
-    env.my_init(workload_file=workload_file)
-
+        
+def train(workload, backfill, debug=False):
+    # ------------------------------------------------------------------
+    # 1. Experiment-wide hyper-parameters & environment construction
+    # ------------------------------------------------------------------
+    seed       = 0
+    epochs     = 300          # how many training loops over the dataset
+    traj_num   = 100          # trajectories per epoch (episodes)
+    
+    if debug:
+        print(f"DEBUG: Training parameters:")
+        print(f"  Workload: {workload}")
+        print(f"  Backfill: {backfill}")
+        print(f"  Epochs: {epochs}")
+        print(f"  Trajectories per epoch: {traj_num}")
+        print(f"  Seed: {seed}")
+    
+    env = HPCEnv(backfill=backfill, debug=debug)  # custom cluster-scheduling env
+    env.seed(seed)                  # reproducible RNG for env
+    current_dir   = os.getcwd()
+    workload_file = os.path.join(current_dir, "data", f"{workload}.swf")
+    
+    # Check if the specified workload file exists
+    if not os.path.exists(workload_file):
+        print(f"ERROR: Workload file not found: {workload_file}")
+        print(f"Available workload files in data/:")
+        data_dir = os.path.join(current_dir, "data")
+        if os.path.exists(data_dir):
+            swf_files = [f for f in os.listdir(data_dir) if f.endswith('.swf')]
+            for swf_file in sorted(swf_files):
+                print(f"  {swf_file}")
+        exit(1)
+    
+    print(f"Using workload: {workload_file}")
+    env.my_init(workload_file=workload_file)  # load the SWF trace
+    
+    if debug:
+        print(f"DEBUG: Workload loaded successfully")
+        print(f"  Number of jobs: {env.loads.size()}")
+        print(f"  Max execution time: {env.loads.max_exec_time}")
+        print(f"  Max processors: {env.loads.max_procs}")
+        # Check first job's carbon consideration
+        if env.loads.size() > 0:
+            first_job = env.loads[0]
+            print(f"  First job carbon consideration: {first_job.carbon_consideration}")
+            print(f"  Job features: {JOB_FEATURES}")
+    
+    # ------------------------------------------------------------------
+    # 2. Device selection (GPU if available)
+    # ------------------------------------------------------------------
     use_cuda = torch.cuda.is_available()
-    device = torch.device("cuda" if use_cuda else "cpu")
-
-    inputNum_size = [MAX_QUEUE_SIZE, run_win, green_win]
-    featureNum_size = [JOB_FEATURES, RUN_FEATURE, GREEN_FEATURE]
-    ppo = PPO(batch_size=256, inputNum_size=inputNum_size,
-              featureNum_size=featureNum_size, device=device)
+    device   = torch.device("cuda" if use_cuda else "cpu")
+    
+    # ------------------------------------------------------------------
+    # 3. PPO agent creation
+    # ------------------------------------------------------------------
+    inputNum_size    = [MAX_QUEUE_SIZE, run_win, green_win]       # grid dims
+    featureNum_size  = [JOB_FEATURES,   RUN_FEATURE, GREEN_FEATURE]
+    
+    ppo = PPO(
+        batch_size      = 256,
+        inputNum_size   = inputNum_size,
+        featureNum_size = featureNum_size,
+        device          = device
+    )
+    
+    # ------------------------------------------------------------------
+    # 4. Outer training loop  (epochs)
+    # ------------------------------------------------------------------
     for epoch in range(epochs):
-        o, r, d, ep_ret, ep_len, show_ret, sjf, f1, greenRwd = env.reset(), 0, False, 0, 0, 0, 0, 0, 0
-        running_num = 0
-        t = 0
+        if debug:
+            print(f"\nDEBUG: Starting epoch {epoch + 1}/{epochs}")
+        # Reset env and bookkeeping for the *first* trajectory of the epoch
+        o, r, d, ep_ret, ep_len, show_ret, sjf, f1, greenRwd = (
+            env.reset(), 0, False, 0, 0, 0, 0, 0, 0
+        )
+        running_num  = 0   # jobs currently running
+        t            = 0   # trajectory counter within this epoch
         epoch_reward = 0
         green_reward = 0
-        wait_reward = 0
+        wait_reward  = 0
+        
+        # --------------------------------------------------------------
+        # 5. Collect trajectories until we hit traj_num
+        # --------------------------------------------------------------
         while True:
+            if debug and t < 3:  # Only debug first few trajectories
+                print(f"  DEBUG: Trajectory {t + 1}, step {ep_len}, running jobs: {running_num}")
+            # ----------------------------------------------------------
+            # 5-a. Build action masks
+            #      mask1 → which queue entries are *valid* jobs
+            #      mask2 → constraints on action2 (delay index)
+            # ----------------------------------------------------------
             lst = []
             for i in range(0, MAX_QUEUE_SIZE * JOB_FEATURES, JOB_FEATURES):
-                if all(o[i:i + JOB_FEATURES] == [0] + [1] * (JOB_FEATURES - 2) + [0]):
-                    lst.append(1)
-                elif all(o[i:i + JOB_FEATURES] == [1] * JOB_FEATURES):
-                    lst.append(1)
+                job_slice = o[i:i + JOB_FEATURES]
+                
+                # Check for padding patterns (mask out with 1)
+                # Pattern 1: [0, 1, 1, 1, 1, 0.5, 0] - job queue padding from HPCSimPickJobs.py line 377
+                padding_pattern1 = [0, 1, 1, 1, 1, 0.5, 0]
+                # Pattern 2: [1, 1, 1, 1, 1, 1, 1] - all ones padding
+                padding_pattern2 = [1] * JOB_FEATURES
+                
+                if (len(job_slice) == len(padding_pattern1) and 
+                    all(abs(job_slice[j] - padding_pattern1[j]) < 1e-6 for j in range(len(job_slice)))):
+                    lst.append(1)  # Mask out (invalid)
+                elif (len(job_slice) == len(padding_pattern2) and 
+                      all(abs(job_slice[j] - padding_pattern2[j]) < 1e-6 for j in range(len(job_slice)))):
+                    lst.append(1)  # Mask out (invalid)
                 else:
-                    lst.append(0)
+                    lst.append(0)  # Valid job
+            
+            # Debug mask creation
+            if debug and t < 3 and ep_len < 5:
+                valid_jobs = lst.count(0)
+                print(f"    MASK DEBUG: Valid jobs found: {valid_jobs}/{MAX_QUEUE_SIZE}")
+                print(f"    MASK DEBUG: First 10 mask values: {lst[:10]}")
+                print(f"    MASK DEBUG: Job queue size from env: {len(env.job_queue)}")
+                # Check the expected padding pattern for 7 features
+                expected_padding = [0, 1, 1, 1, 1, 0.5, 0]
+                print(f"    MASK DEBUG: Expected padding pattern (7 features): {expected_padding}")
+                # Check a few job slices
+                for idx in range(min(3, MAX_QUEUE_SIZE)):
+                    start = idx * JOB_FEATURES
+                    end = start + JOB_FEATURES
+                    slice_data = o[start:end]
+                    mask_val = lst[idx]
+                    print(f"    MASK DEBUG: Job {idx}: mask={mask_val}, features={slice_data}")
+            
             mask2 = np.zeros(action2_num, dtype=int)
-
-            if running_num < delayMaxJobNum:
-                mask2[running_num + 1:delayMaxJobNum + 1] = 1
-            with torch.no_grad():
-                o = o.reshape(1, MAX_QUEUE_SIZE + run_win + green_win, JOB_FEATURES)
-                state = torch.FloatTensor(o).to(device)
-                mask1 = np.array(lst).reshape(1, MAX_QUEUE_SIZE)
-                mask1 = torch.FloatTensor(mask1).to(device)
-                mask2 = mask2.reshape(1, action2_num)
-                mask2 = torch.FloatTensor(mask2).to(device)
-                action1, log_prob1, action2, log_prob2, value, job_input = ppo.choose_action(state, mask1, mask2)
-            ppo.remember(state, value, log_prob1, log_prob2, action1, action2, greenRwd, mask1, mask2, device,
-                         job_input)
-            o, r, d, r2, sjf_t, f1_t, running_num, greenRwd = env.step(action1.item(), action2.item())
-            ep_ret += r
-            ep_len += 1
-            show_ret += r2
-            sjf += sjf_t
-            f1 += f1_t
-
-            green_reward += greenRwd
-            wait_reward += r
+            if running_num < delayMaxJobNum:                 # cannot delay past running capacity
+                mask2[running_num + 1 : delayMaxJobNum + 1] = 1
+            
+            # ----------------------------------------------------------
+            # 5-b. State → tensor; ask PPO for an action
+            # ----------------------------------------------------------
+            with torch.no_grad():                            # inference only
+                o_reshaped = o.reshape(1, MAX_QUEUE_SIZE + run_win + green_win, JOB_FEATURES)
+                state  = torch.FloatTensor(o_reshaped).to(device)
+                mask1T = torch.FloatTensor(np.array(lst).reshape(1, MAX_QUEUE_SIZE)).to(device)
+                mask2T = torch.FloatTensor(mask2.reshape(1, action2_num)).to(device)
+                
+                action1, log_prob1, action2, log_prob2, value, job_input = \
+                    ppo.choose_action(state, mask1T, mask2T)
+            
+            # Store transition in PPO's rollout buffer
+            ppo.remember(
+                state, value, log_prob1, log_prob2, action1,
+                action2, greenRwd, mask1T, mask2T, device, job_input
+            )
+            
+            # ----------------------------------------------------------
+            # 5-c. Step the environment
+            # ----------------------------------------------------------
+            if debug and t < 3 and ep_len < 5:  # Only debug first few steps of first trajectories
+                print(f"    Action1: {action1.item()}, Action2: {action2.item()}")
+                
+            o, r, d, r2, sjf_t, f1_t, running_num, greenRwd = \
+                env.step(action1.item(), action2.item())
+                
+            if debug and t < 3 and ep_len < 5:
+                print(f"    Reward: {r:.4f}, Green reward: {greenRwd:.4f}, Done: {d}")
+            
+            # Trajectory-level bookkeeping
+            ep_ret   += r
+            ep_len   += 1
+            show_ret += r2      # additional metric for reporting
+            sjf      += sjf_t   # schedule fairness proxy
+            f1       += f1_t    # some QoS metric
+            
+            # Reward components
+            green_reward += greenRwd   # energy-aware part
+            wait_reward  += r          # waiting-time part
             epoch_reward += eta * r + greenRwd
-
+            
+            # ----------------------------------------------------------
+            # 5-d. If episode ends → push terminal reward, maybe finish epoch
+            # ----------------------------------------------------------
             if d:
-                t += 1
-                ppo.storeIntoBuffter(eta * r + greenRwd)
-                ppo.clear_memory()
-                o, r, d, ep_ret, ep_len, show_ret, sjf, f1, greenRwd = env.reset(), 0, False, 0, 0, 0, 0, 0, 0
+                if debug and t < 3:
+                    print(f"  DEBUG: Episode {t + 1} completed, episode return: {ep_ret:.4f}, steps: {ep_len}")
+                    
+                t += 1                                     # finished a trajectory
+                ppo.storeIntoBuffter(eta * r + greenRwd)   # final R for GAE
+                ppo.clear_memory()                         # reset per-traj state
+                
+                # reset env for next trajectory
+                o, r, d, ep_ret, ep_len, show_ret, sjf, f1, greenRwd = (
+                    env.reset(), 0, False, 0, 0, 0, 0, 0, 0
+                )
                 running_num = 0
-                if t >= traj_num:
+                
+                if t >= traj_num:     # collected enough rollouts for this epoch
+                    if debug:
+                        print(f"  DEBUG: Epoch {epoch + 1} data collection complete ({t} trajectories)")
                     break
-
+        
+        # --------------------------------------------------------------
+        # 6. Policy / value-function update after traj_num rollouts
+        # --------------------------------------------------------------
+        if debug:
+            print(f"  DEBUG: Starting policy update for epoch {epoch + 1}")
+            
         ppo.train()
-        with open('MARL_'+workload_name+'.csv', mode='a',
-                  newline='') as file:
-            writer = csv.writer(file)
-            writer.writerow(
-                [float(epoch_reward / traj_num), float(green_reward / traj_num), float(wait_reward / traj_num)])
+        
+        if debug:
+            print(f"  DEBUG: Policy update complete")
+        
+        # --------------------------------------------------------------
+        # 7. Logging: append averaged rewards to CSV
+        # --------------------------------------------------------------
+        avg_epoch_reward = epoch_reward / traj_num
+        avg_green_reward = green_reward / traj_num
+        avg_wait_reward = wait_reward / traj_num
+        
+        with open(f"MARL_{workload}.csv", mode="a", newline="") as file:
+            csv.writer(file).writerow([
+                avg_epoch_reward,
+                avg_green_reward,
+                avg_wait_reward
+            ])
+        
+        if debug:
+            print(f"  DEBUG: Epoch {epoch + 1} summary:")
+            print(f"    Total reward: {avg_epoch_reward:.4f}")
+            print(f"    Green reward: {avg_green_reward:.4f}")
+            print(f"    Wait reward: {avg_wait_reward:.4f}")
+        elif (epoch + 1) % 10 == 0:  # Print every 10 epochs when not in debug mode
+            print(f"Epoch {epoch + 1}/{epochs} - Total: {avg_epoch_reward:.4f}, Green: {avg_green_reward:.4f}, Wait: {avg_wait_reward:.4f}")
+        
+        # Save model weights every 5 epochs
+        if (epoch + 1) % 5 == 0:
+            checkpoint_path = f"{workload}/MARL_checkpoints/epoch_{epoch + 1}/"
+            ppo.save_using_model_name(checkpoint_path)
+            if debug or (epoch + 1) % 10 == 0:
+                print(f"  Saved checkpoint at epoch {epoch + 1}: {checkpoint_path}")
+        
+        # clear buffers so next epoch starts fresh
         ppo.buffer.clear_buffer()
+    
+    # ------------------------------------------------------------------
+    # 8. Persist the trained model
+    # ------------------------------------------------------------------
+    ppo.save_using_model_name(f"{workload}/MARL/")
 
-    ppo.save_using_model_name(workload_name + '/MARL/')
 
 
 
@@ -546,5 +713,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--workload', type=str, default='lublin_256')
     parser.add_argument('--backfill', type=int, default=0)
+    parser.add_argument('--debug', action='store_true', help='Enable debug prints')
     args = parser.parse_args()
-    train(args.workload, args.backfill)
+    train(args.workload, args.backfill, args.debug)

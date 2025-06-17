@@ -432,6 +432,14 @@ def train(workload,backfill):
                   newline='') as file:
             writer = csv.writer(file)
             writer.writerow([float(epoch_reward / traj_num),float(green_reward / traj_num),float(wait_reward / traj_num)])
+        
+        # Save model weights every 5 epochs
+        if (epoch + 1) % 5 == 0:
+            checkpoint_path = f"{workload_name}/MaskablePPO_checkpoints/epoch_{epoch + 1}/"
+            ppo.save_using_model_name(checkpoint_path)
+            if (epoch + 1) % 10 == 0:
+                print(f"Saved checkpoint at epoch {epoch + 1}: {checkpoint_path}")
+        
         ppo.buffer.clear_buffer()
 
     ppo.save_using_model_name(workload_name + '/MaskablePPO')

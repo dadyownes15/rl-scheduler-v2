@@ -8,6 +8,7 @@ import gym
 from gym import spaces
 from gym.utils import seeding
 import configparser
+from greenPower import MAX_CARBON_INTENSITY
 
 config = configparser.ConfigParser()
 config.read('configFile/config.ini')
@@ -20,18 +21,16 @@ green_win = int(config.get('GAS-MARL setting', 'green_win'))
 delayMaxJobNum = int(config.get('GAS-MARL setting', 'delayMaxJobNum'))
 delayTimeList = eval(config.get('GAS-MARL setting', 'delayTimeList'))
 
-turbinePowerNominal = float(config.get('general setting', 'turbinePowerNominal'))
-numberPv = float(config.get('general setting', 'numberPv'))
 processor_per_machine = int(config.get('general setting', 'processor_per_machine'))
 idlePower = float(config.get('general setting', 'idlePower'))
 MAX_perProcPower = float(config.get('general setting', 'MAX_perProcPower'))
-
+carbon_year = int(config.get('general setting', 'carbon_year'))
 
 MAX_POWER = 19000
 MAX_GREEN = 19000
 MAX_WAIT_TIME = 12 * 60 * 60
 MAX_RUN_TIME = 12 * 60 * 60
-JOB_FEATURES = 8
+JOB_FEATURES = 7
 JOB_SEQUENCE_SIZE = MAX_QUEUE_SIZE
 RUN_FEATURE = 4
 GREEN_FEATURE = 2
@@ -50,7 +49,8 @@ def discount_cumsum(x, discount):
 
 
 class HPCEnv(gym.Env):
-    def __init__(self, backfill=False):  # do nothing and return. A workaround for passing parameters to the environment
+    def __init__(self, backfill=False, debug=False):  # do nothing and return. A workaround for passing parameters to the environment
+        self.debug = debug
         super(HPCEnv, self).__init__()
         print("Initialize Simple HPC Env")
 
@@ -83,7 +83,7 @@ class HPCEnv(gym.Env):
     def my_init(self, workload_file='', sched_file=''):
         print("loading workloads from dataset:", workload_file)
         self.loads = Workloads(workload_file)
-        self.cluster = Cluster("Cluster", self.loads.max_nodes, self.loads.max_procs / self.loads.max_nodes,processor_per_machine,idlePower,green_win,numberPv,turbinePowerNominal)
+        self.cluster = Cluster("Cluster", self.loads.max_nodes, self.loads.max_procs / self.loads.max_nodes, processor_per_machine, idlePower, green_win, year=carbon_year)
 
     def seed(self, seed=None):
         self.np_random, seed = seeding.np_random(seed)
@@ -130,7 +130,11 @@ class HPCEnv(gym.Env):
 
         job_sequence_size = JOB_SEQUENCE_SIZE
 
-        self.start = self.np_random.randint(job_sequence_size, (self.loads.size() - job_sequence_size - 1))
+        # Fix numpy compatibility: use integers() for newer numpy versions
+        if hasattr(self.np_random, 'integers'):
+            self.start = self.np_random.integers(job_sequence_size, (self.loads.size() - job_sequence_size - 1))
+        else:
+            self.start = self.np_random.randint(job_sequence_size, (self.loads.size() - job_sequence_size - 1))
 
         self.start_idx_last_reset = self.start
         self.num_job_in_batch = job_sequence_size
@@ -326,7 +330,15 @@ class HPCEnv(gym.Env):
             if not not_empty:
                 break
         self.post_process_score(scheduled_logs)
-        greenRwd = self.cluster.greenPower.getGreenPowerUtilization(self.cluster.PowerStruc.powerSlotLog)
+        
+        # Get all jobs that were scheduled in this episode for carbon-aware reward
+        scheduledJobs = []
+        for job in self.loads.all_jobs:
+            if hasattr(job, 'scheduled_time') and job.scheduled_time != -1:
+                scheduledJobs.append(job)
+        
+        carbonRwd = self.cluster.carbonIntensity.getCarbonAwareReward(
+            self.cluster.PowerStruc.powerSlotLog, scheduledJobs)
 
         self.cluster.reset()
         self.loads.reset()
@@ -339,7 +351,7 @@ class HPCEnv(gym.Env):
         self.last_job_in_batch = self.start + self.num_job_in_batch
         self.next_arriving_job_idx = self.start + 1
 
-        return scheduled_logs,greenRwd
+        return scheduled_logs,carbonRwd
 
     def build_observation(self):
         vector = np.zeros((MAX_QUEUE_SIZE + run_win + green_win) * JOB_FEATURES, dtype=float)
@@ -356,13 +368,13 @@ class HPCEnv(gym.Env):
                              min(float(job.power) / float(MAX_POWER), 1.0 - 1e-5),
                              min(float(job.power / job.request_number_of_processors) / float(MAX_perProcPower),
                                  1.0 - 1e-5),
-                             *self.cluster.getGreenJobState(job, self.current_timestamp, currentSlot),
+                             float(job.carbon_consideration) / 4.0,  # Normalize 0-4 to 0-1
                              1.0 - 1e-5 if self.cluster.can_allocated(job) else 1e-5
                          ]
                          for i, job in enumerate(self.job_queue)
                          if i < MAX_QUEUE_SIZE
                      ] + [
-                         [None, 0, 1, 1, 1, 1, 1, 1, 0]
+                         [None, 0, 1, 1, 1, 1, 0.5, 0]  # Updated padding for 7 features
                          for _ in range(MAX_QUEUE_SIZE - len(self.job_queue))
                      ]
 
@@ -377,12 +389,13 @@ class HPCEnv(gym.Env):
                                   MAX_perProcPower), 1.0 - 1e-5),
                               min(float(temp_job.scheduled_time + temp_job.request_time - self.current_timestamp) / float(
                                   self.loads.max_exec_time), 1.0 - 1e-5),
-                              0,0,0,0
+                              float(temp_job.carbon_consideration) / 4.0,  # Carbon consideration
+                              0, 0  # Padding to make it 7 features
                           ]
                           for i, temp_job in enumerate(self.running_jobs[:run_win])
                           if i < run_win
                       ] + [
-                          [0, 0, 0, 0, 0,0,0,0]
+                          [0, 0, 0, 0, 0.5, 0, 0]  # 7 features for padding
                           for _ in range(run_win - len(self.running_jobs))
                       ]
         vector[MAX_QUEUE_SIZE * JOB_FEATURES:(MAX_QUEUE_SIZE + run_win) * JOB_FEATURES] = [
@@ -391,19 +404,19 @@ class HPCEnv(gym.Env):
 
 
 
-        green = self.cluster.greenPower.getGreenPowerSlot(self.current_timestamp)
-        green_slot = [
+        green = self.cluster.carbonIntensity.getCarbonIntensitySlot(self.current_timestamp)
+        carbon_slot = [
             [
-                min(float(greenPower['lastTime']) / float(self.loads.max_exec_time), 1.0 - 1e-5),
-                min(float(greenPower['power']) / float(MAX_GREEN), 1.0 - 1e-5),
-                0,0,0,0,0,0
+                min(float(carbonSlot['lastTime']) / float(self.loads.max_exec_time), 1.0 - 1e-5),
+                min(float(carbonSlot['carbonIntensity']) / MAX_CARBON_INTENSITY, 1.0 - 1e-5),  # Normalize by max carbon intensity
+                0, 0, 0, 0, 0  # Padding to make it 7 features
             ]
-            for greenPower in green
+            for carbonSlot in green
         ]
 
         start_index = MAX_QUEUE_SIZE + run_win
         end_index = MAX_QUEUE_SIZE + run_win + green_win
-        vector[start_index * JOB_FEATURES:end_index * JOB_FEATURES] = [item for slot in green_slot[
+        vector[start_index * JOB_FEATURES:end_index * JOB_FEATURES] = [item for slot in carbon_slot[
                                                                                         start_index - MAX_QUEUE_SIZE - run_win:end_index - MAX_QUEUE_SIZE - run_win]
                                                                        for item in slot]
 
@@ -568,6 +581,8 @@ class HPCEnv(gym.Env):
 
     def valid(self, a):
         action = a[0]
+        if action >= len(self.pairs) or self.pairs[action][0] is None:
+            return None  # Invalid action
         return self.pairs[action][0]
 
     def skip1(self,a2):
@@ -895,7 +910,15 @@ class HPCEnv(gym.Env):
 
 
         self.post_process_score(scheduled_logs)
-        greenRwd = self.cluster.greenPower.getGreenPowerUtilization(self.cluster.PowerStruc.powerSlotLog)
+        
+        # Get all jobs that were scheduled in this episode for carbon-aware reward
+        scheduledJobs = []
+        for job in self.loads.all_jobs:
+            if hasattr(job, 'scheduled_time') and job.scheduled_time != -1:
+                scheduledJobs.append(job)
+        
+        carbonRwd = self.cluster.carbonIntensity.getCarbonAwareReward(
+            self.cluster.PowerStruc.powerSlotLog, scheduledJobs)
 
         self.cluster.reset()
         self.loads.reset()
@@ -908,10 +931,24 @@ class HPCEnv(gym.Env):
         self.last_job_in_batch = self.start + self.num_job_in_batch
         self.next_arriving_job_idx = self.start + 1
 
-        return scheduled_logs,greenRwd
+        return scheduled_logs,carbonRwd
 
-    def step(self, a1,a2):
+    def step(self, a1, a2):
+        # Check if a1 is valid and points to an actual job (not padding)
+        if self.debug:
+            print(f"      STEP DEBUG: a1={a1}, a2={a2}, pairs_len={len(self.pairs)}")
+            print(f"      STEP DEBUG: job_queue_size={len(self.job_queue)}")
+            
+        if a1 >= len(self.pairs) or self.pairs[a1][0] is None:
+            if self.debug:
+                print(f"      STEP DEBUG: Invalid action - a1={a1} out of bounds or job is None")
+            # Invalid action - return neutral state
+            obs = self.build_observation()
+            return [obs, 0, False, 0, 0, 0, len(self.running_jobs), 0]
+        
         job_for_scheduling = self.pairs[a1][0]
+        if self.debug:
+            print(f"      STEP DEBUG: Selected job {job_for_scheduling.job_id}, carbon_consideration={job_for_scheduling.carbon_consideration}")
         if self.backfill==1:
             done=self.schedule_backfill(job_for_scheduling,a2)
         if self.backfill==2:
@@ -932,9 +969,14 @@ class HPCEnv(gym.Env):
             rl_total = sum(self.scheduled_rl.values())
 
             rwd = -rl_total
-            greenRwd = self.cluster.greenPower.getGreenPowerUtilization(self.cluster.PowerStruc.powerSlotLog)
+            
+            # Get all jobs scheduled for carbon-aware reward
+            scheduledJobs = [job for job in self.loads.all_jobs 
+                           if hasattr(job, 'scheduled_time') and job.scheduled_time != -1]
+            carbonRwd = self.cluster.carbonIntensity.getCarbonAwareReward(
+                self.cluster.PowerStruc.powerSlotLog, scheduledJobs)
 
-            return [None, rwd, True, 0, 0, 0,len(self.running_jobs),greenRwd]
+            return [None, rwd, True, 0, 0, 0,len(self.running_jobs),carbonRwd]
 
     def step_for_ga(self, a1,a2):
         job_for_scheduling = self.job_queue[a1]
@@ -957,8 +999,13 @@ class HPCEnv(gym.Env):
             self.post_process_score(self.scheduled_rl)
             rl_total = sum(self.scheduled_rl.values())
             rwd = -rl_total
-            greenRwd = self.cluster.greenPower.getGreenPowerUtilization(self.cluster.PowerStruc.powerSlotLog)
-            return [None, rwd, True,len(self.running_jobs),greenRwd]
+            
+            # Get all jobs scheduled for carbon-aware reward
+            scheduledJobs = [job for job in self.loads.all_jobs 
+                           if hasattr(job, 'scheduled_time') and job.scheduled_time != -1]
+            carbonRwd = self.cluster.carbonIntensity.getCarbonAwareReward(
+                self.cluster.PowerStruc.powerSlotLog, scheduledJobs)
+            return [None, rwd, True,len(self.running_jobs),carbonRwd]
 
 
     def job_score1(self, job_for_scheduling):
@@ -1068,7 +1115,10 @@ class HPCEnv(gym.Env):
         self.post_process_score(scheduled_logs)
         rl_total = sum(scheduled_logs.values())
         rwd1 = -rl_total
-        greenRwd=self.cluster.greenPower.getGreenPowerUtilization(Temp_power.powerSlotLog)
+        
+        # Get all jobs scheduled for carbon-aware reward
+        scheduledJobs = [job for job in runningJobs if hasattr(job, 'scheduled_time') and job.scheduled_time != -1]
+        carbonRwd = self.cluster.carbonIntensity.getCarbonAwareReward(Temp_power.powerSlotLog, scheduledJobs)
 
-        return rwd1,greenRwd
+        return rwd1,carbonRwd
 

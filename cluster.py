@@ -1,6 +1,6 @@
 import math
 from PowerStruc import power_struc
-from greenPower import green_power
+from greenPower import carbon_intensity
 
 class Machine:
     def __init__(self, id):
@@ -39,7 +39,7 @@ class Machine:
 
 
 class Cluster:
-    def __init__(self, cluster_name, node_num, num_procs_per_node,processor_per_machine,idlePower,greenWin,numberPv,turbinePowerNominal):
+    def __init__(self, cluster_name, node_num, num_procs_per_node, processor_per_machine, idlePower, greenWin, year=2021):
         self.name = cluster_name
         self.total_node = node_num
         self.free_node = node_num
@@ -48,8 +48,8 @@ class Cluster:
         self.all_nodes = []
         self.statPower = idlePower*math.ceil(self.total_node / processor_per_machine)
         self.PowerStruc = power_struc(self.statPower)
-        self.greenPower = green_power(greenWin,numberPv,turbinePowerNominal)
-        self.green_win=greenWin
+        self.carbonIntensity = carbon_intensity(greenWin, year)
+        self.green_win = greenWin
         for i in range(self.total_node):
             self.all_nodes.append(Machine(i))
 
@@ -112,46 +112,6 @@ class Cluster:
         for m in self.all_nodes:
             m.reset()
 
-    def getGreenJobState(self,job,currentTime,currentSlot):
-        start=currentTime
-        end=start+job.request_time
-        power=job.power
-        jobEnergy=power*job.request_time
-        powerSlot,beforeList = self.PowerStruc.getPre(start,end,power,currentSlot)
-        totalEnergyBefore=0
-        usedGreenBefore=0
-        totalEnergyAfter=0
-        usedGreenAfter=0
-        minIndex=int(currentTime/3600)
-        maxIndex=minIndex+self.green_win-1
-        for i in range(len(powerSlot)-1):
-            powerAfter=powerSlot[i]['power']
-            startAfter=powerSlot[i]['timeSlot']
-            endAfter=powerSlot[i+1]['timeSlot']
-            lastTimeAfter=endAfter-startAfter
-            consumeEnergyAfter=lastTimeAfter*powerAfter
-            totalEnergyAfter+=consumeEnergyAfter
-            inc_usedGreenAfter=self.greenPower.getGreenUtiliEstimate(powerAfter,startAfter,endAfter,minIndex,maxIndex)
-            usedGreenAfter+=inc_usedGreenAfter
-
-            powerBefore=beforeList[i]['power']
-            startBefore=beforeList[i]['timeSlot']
-            endBefore=beforeList[i+1]['timeSlot']
-            lastTimeBefore=endBefore-startBefore
-            consumeEnergyBefore=lastTimeBefore*powerBefore
-            totalEnergyBefore+=consumeEnergyBefore
-            inc_usedGreenBefore=self.greenPower.getGreenUtiliEstimate(powerBefore,startBefore,endBefore,minIndex,maxIndex)
-            usedGreenBefore+=inc_usedGreenBefore
-
-        BrownEnergyBefore=totalEnergyBefore-usedGreenBefore
-        BrownEnergyAfter=totalEnergyAfter-usedGreenAfter
-
-        jobBrownEnergy=BrownEnergyAfter-BrownEnergyBefore
-        if jobBrownEnergy==0:
-            return 0,0
-        else:
-            return 1,jobBrownEnergy/jobEnergy
-
     def backfill_check(self,running_jobs,job,current_time,backfill=1):
         if not self.can_allocated(job):
             return False
@@ -162,9 +122,9 @@ class Cluster:
                                                         current_time + job.request_time,
                                                         job.power,currentSlot)
         totalEnergyBefore=0
-        usedGreenBefore=0
+        carbonEmissionsBefore=0
         totalEnergyAfter=0
-        usedGreenAfter=0
+        carbonEmissionsAfter=0
         minIndex=int(current_time/3600)
         maxIndex=minIndex+self.green_win-1
 
@@ -175,8 +135,8 @@ class Cluster:
             lastTimeAfter = endAfter - startAfter
             consumeEnergyAfter = lastTimeAfter * powerAfter
             totalEnergyAfter += consumeEnergyAfter
-            inc_usedGreenAfter = self.greenPower.getGreenUtiliEstimate(powerAfter, startAfter, endAfter,minIndex,maxIndex)
-            usedGreenAfter += inc_usedGreenAfter
+            inc_carbonEmissionsAfter = self.carbonIntensity.getCarbonEmissionsEstimate(powerAfter, startAfter, endAfter,minIndex,maxIndex)
+            carbonEmissionsAfter += inc_carbonEmissionsAfter
 
             powerBefore = beforeList[i]['power']
             startBefore = beforeList[i]['timeSlot']
@@ -184,17 +144,14 @@ class Cluster:
             lastTimeBefore = endBefore - startBefore
             consumeEnergyBefore = lastTimeBefore * powerBefore
             totalEnergyBefore += consumeEnergyBefore
-            inc_usedGreenBefore = self.greenPower.getGreenUtiliEstimate(powerBefore, startBefore, endBefore,minIndex,maxIndex)
-            usedGreenBefore += inc_usedGreenBefore
+            inc_carbonEmissionsBefore = self.carbonIntensity.getCarbonEmissionsEstimate(powerBefore, startBefore, endBefore,minIndex,maxIndex)
+            carbonEmissionsBefore += inc_carbonEmissionsBefore
 
-        BrownEnergyBefore = totalEnergyBefore - usedGreenBefore
-        BrownEnergyAfter = totalEnergyAfter - usedGreenAfter
-
-        jobBrownEnergy = BrownEnergyAfter - BrownEnergyBefore
+        jobCarbonEmissions = carbonEmissionsAfter - carbonEmissionsBefore
 
         # return True #EASY
 
-        if jobBrownEnergy < 50000:
+        if jobCarbonEmissions < 50000:  # Threshold in gCO2eq - may need adjustment
             return True
         else:
             return False
@@ -206,9 +163,9 @@ class Cluster:
                                                         current_time + job.request_time,
                                                         job.power,currentSlot)
         totalEnergyBefore=0
-        usedGreenBefore=0
+        carbonEmissionsBefore=0
         totalEnergyAfter=0
-        usedGreenAfter=0
+        carbonEmissionsAfter=0
         minIndex=int(current_time/3600)
         maxIndex=minIndex+self.green_win-1
 
@@ -219,8 +176,8 @@ class Cluster:
             lastTimeAfter = endAfter - startAfter
             consumeEnergyAfter = lastTimeAfter * powerAfter
             totalEnergyAfter += consumeEnergyAfter
-            inc_usedGreenAfter = self.greenPower.getGreenUtiliEstimate(powerAfter, startAfter, endAfter,minIndex,maxIndex)
-            usedGreenAfter += inc_usedGreenAfter
+            inc_carbonEmissionsAfter = self.carbonIntensity.getCarbonEmissionsEstimate(powerAfter, startAfter, endAfter,minIndex,maxIndex)
+            carbonEmissionsAfter += inc_carbonEmissionsAfter
 
             powerBefore = beforeList[i]['power']
             startBefore = beforeList[i]['timeSlot']
@@ -228,15 +185,12 @@ class Cluster:
             lastTimeBefore = endBefore - startBefore
             consumeEnergyBefore = lastTimeBefore * powerBefore
             totalEnergyBefore += consumeEnergyBefore
-            inc_usedGreenBefore = self.greenPower.getGreenUtiliEstimate(powerBefore, startBefore, endBefore,minIndex,maxIndex)
-            usedGreenBefore += inc_usedGreenBefore
+            inc_carbonEmissionsBefore = self.carbonIntensity.getCarbonEmissionsEstimate(powerBefore, startBefore, endBefore,minIndex,maxIndex)
+            carbonEmissionsBefore += inc_carbonEmissionsBefore
 
-        BrownEnergyBefore = totalEnergyBefore - usedGreenBefore
-        BrownEnergyAfter = totalEnergyAfter - usedGreenAfter
+        jobCarbonEmissions = carbonEmissionsAfter - carbonEmissionsBefore
 
-        jobBrownEnergy = BrownEnergyAfter - BrownEnergyBefore
-
-        if jobBrownEnergy < 50000:
+        if jobCarbonEmissions < 50000:  # Threshold in gCO2eq - may need adjustment
             return True
         else:
             return False
@@ -251,9 +205,9 @@ class Cluster:
                                                         current_time + job.request_time,
                                                         job.power,currentSlot)
         totalEnergyBefore=0
-        usedGreenBefore=0
+        carbonEmissionsBefore=0
         totalEnergyAfter=0
-        usedGreenAfter=0
+        carbonEmissionsAfter=0
         minIndex=int(minGreen/3600)
         maxIndex=minIndex+self.green_win-1
         for i in range(len(slotList) - 1):
@@ -263,8 +217,8 @@ class Cluster:
             lastTimeAfter = endAfter - startAfter
             consumeEnergyAfter = lastTimeAfter * powerAfter
             totalEnergyAfter += consumeEnergyAfter
-            inc_usedGreenAfter = self.greenPower.getGreenUtiliEstimate(powerAfter, startAfter, endAfter,minIndex,maxIndex)
-            usedGreenAfter += inc_usedGreenAfter
+            inc_carbonEmissionsAfter = self.carbonIntensity.getCarbonEmissionsEstimate(powerAfter, startAfter, endAfter,minIndex,maxIndex)
+            carbonEmissionsAfter += inc_carbonEmissionsAfter
 
             powerBefore = beforeList[i]['power']
             startBefore = beforeList[i]['timeSlot']
@@ -272,16 +226,12 @@ class Cluster:
             lastTimeBefore = endBefore - startBefore
             consumeEnergyBefore = lastTimeBefore * powerBefore
             totalEnergyBefore += consumeEnergyBefore
-            inc_usedGreenBefore = self.greenPower.getGreenUtiliEstimate(powerBefore, startBefore, endBefore,minIndex,maxIndex)
-            usedGreenBefore += inc_usedGreenBefore
+            inc_carbonEmissionsBefore = self.carbonIntensity.getCarbonEmissionsEstimate(powerBefore, startBefore, endBefore,minIndex,maxIndex)
+            carbonEmissionsBefore += inc_carbonEmissionsBefore
 
-        BrownEnergyBefore = totalEnergyBefore - usedGreenBefore
-        BrownEnergyAfter = totalEnergyAfter - usedGreenAfter
+        jobCarbonEmissions = carbonEmissionsAfter - carbonEmissionsBefore
 
-        jobBrownEnergy = BrownEnergyAfter - BrownEnergyBefore
-
-
-        if jobBrownEnergy < 50000:
+        if jobCarbonEmissions < 50000:  # Threshold in gCO2eq - may need adjustment
             return True
         else:
             return False

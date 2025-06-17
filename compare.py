@@ -6,8 +6,10 @@ from HPCSimPickJobs import *
 
 
 from MaskablePPO import PPO
+from MaskablePPO_Carbon import PPO as PPO_Carbon
 from GA import GA
 from  MARL import PPO as MARL
+from  MARL_Plus import PPO as MARL_Plus
 
 
 def column_averages(matrix):
@@ -35,6 +37,16 @@ def load_policy(modelName,model_path):
 
     elif modelName == 'PPO':
         model = PPO(batch_size=256, inputNum_size=inputNum_size,
+                  featureNum_size=featureNum_size, device=device)
+        model.load_using_model_name(model_path)
+
+    elif modelName == 'PPO_Carbon':
+        model = PPO_Carbon(batch_size=256, inputNum_size=inputNum_size,
+                  featureNum_size=featureNum_size, device=device)
+        model.load_using_model_name(model_path)
+
+    elif modelName == 'MARL_Plus':
+        model = MARL_Plus(batch_size=256, inputNum_size=inputNum_size,
                   featureNum_size=featureNum_size, device=device)
         model.load_using_model_name(model_path)
 
@@ -129,14 +141,18 @@ def GA_policy(env,eta):
 # @profile
 def run_policy(env, nums, iters):
     PPO_r = []
+    PPO_Carbon_r = []
     MARL_r = []
+    MARL_Plus_r = []
     fcfs_r = []
     lptpn_r=[]
     GA_r=[]
     f2_r=[]
 
     PPO_path=workload_name +'/MaskablePPO/'
+    PPO_Carbon_path=workload_name +'/MaskablePPO_Carbon/'
     MARL_path=workload_name +'/MARL/'
+    MARL_Plus_path=workload_name +'/MARL_Plus/'
 
     seed = 0
     random.seed(seed)
@@ -166,9 +182,19 @@ def run_policy(env, nums, iters):
         PPO_r.append([-reward1,greenRwd,eta*reward1+greenRwd])
         env.reset_for_test(nums, start)
 
+        model=load_policy('PPO_Carbon', PPO_Carbon_path)
+        reward1, greenRwd=RL_OneAction(model,env)
+        PPO_Carbon_r.append([-reward1,greenRwd,eta*reward1+greenRwd])
+        env.reset_for_test(nums, start)
+
         model=load_policy('MARL', MARL_path)
         reward1, greenRwd=RL_MultiAction(model,env)
         MARL_r.append([-reward1,greenRwd,eta*reward1+greenRwd])
+        env.reset_for_test(nums, start)
+
+        model=load_policy('MARL_Plus', MARL_Plus_path)
+        reward1, greenRwd=RL_MultiAction(model,env)
+        MARL_Plus_r.append([-reward1,greenRwd,eta*reward1+greenRwd])
         env.reset_for_test(nums, start)
 
     algorithms = {
@@ -177,7 +203,9 @@ def run_policy(env, nums, iters):
         "LPTPN": column_averages(lptpn_r),
         "GA": column_averages(GA_r),
         "PPO": column_averages(PPO_r),
+        "PPO_Carbon": column_averages(PPO_Carbon_r),
         "MARL": column_averages(MARL_r),
+        "MARL_Plus": column_averages(MARL_Plus_r),
     }
 
     filtered_results = {
