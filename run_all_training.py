@@ -11,6 +11,7 @@ import sys
 import time
 import os
 import platform
+import argparse
 
 def get_python_executable():
     """Get the correct Python executable for the current platform"""
@@ -25,13 +26,14 @@ def get_python_executable():
         except:
             return "python3"
 
-def run_algorithm(algorithm_name, script_name, workload, epochs, backfill):
+def run_algorithm(algorithm_name, script_name, workload, epochs, backfill, debug=False):
     """Run a single algorithm training"""
     print(f"\n{'='*60}")
     print(f"Starting {algorithm_name} training...")
     print(f"Workload: {workload}")
     print(f"Epochs: {epochs}")
     print(f"Backfill: {backfill}")
+    print(f"Debug mode: {'ON' if debug else 'OFF'}")
     print(f"Platform: {platform.system()}")
     print(f"{'='*60}")
     
@@ -45,15 +47,20 @@ def run_algorithm(algorithm_name, script_name, workload, epochs, backfill):
             "--backfill", str(backfill)
         ]
         
+        # Add debug flag if enabled
+        if debug:
+            cmd.append("--debug")
+        
         print(f"Running command: {' '.join(cmd)}")
         
-        # Platform-specific subprocess settings
+        # Platform-specific subprocess settings - allow real-time output
         if platform.system() == "Windows":
             # On Windows, we need to handle the console properly
             result = subprocess.run(
                 cmd, 
                 check=True, 
-                capture_output=True, 
+                stdout=None,  # Let output go directly to terminal
+                stderr=None,  # Let errors go directly to terminal
                 text=True,
                 encoding='utf-8',
                 errors='replace'  # Handle any encoding issues gracefully
@@ -62,19 +69,14 @@ def run_algorithm(algorithm_name, script_name, workload, epochs, backfill):
             result = subprocess.run(
                 cmd, 
                 check=True, 
-                capture_output=True, 
+                stdout=None,  # Let output go directly to terminal
+                stderr=None,  # Let errors go directly to terminal
                 text=True,
                 encoding='utf-8',
                 errors='replace'
             )
         
-        # Print any output
-        if result.stdout:
-            print("STDOUT:")
-            print(result.stdout)
-        if result.stderr:
-            print("STDERR:")
-            print(result.stderr)
+        # No need to print output since it goes directly to terminal
             
         end_time = time.time()
         duration = end_time - start_time
@@ -89,13 +91,7 @@ def run_algorithm(algorithm_name, script_name, workload, epochs, backfill):
         print(f"\n❌ {algorithm_name} failed!")
         print(f"Error code: {e.returncode}")
         print(f"Training time before failure: {duration:.2f} seconds")
-        
-        if e.stdout:
-            print("STDOUT:")
-            print(e.stdout)
-        if e.stderr:
-            print("STDERR:")
-            print(e.stderr)
+        print("Error details should be visible in the output above.")
             
         return False
     
@@ -179,17 +175,31 @@ def check_system_requirements():
     return True
 
 def main():
-    # Configuration
-    workload = "lublin_256_carbon_float"
-    epochs = 60
-    backfill = 2
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Run all RL algorithms for carbon-aware scheduling')
+    parser.add_argument('--workload', type=str, default='lublin_256_carbon_float',
+                        help='Workload name (default: lublin_256_carbon_float)')
+    parser.add_argument('--epochs', type=int, default=60,
+                        help='Number of epochs per algorithm (default: 60)')
+    parser.add_argument('--backfill', type=int, default=2,
+                        help='Backfill mode (default: 2)')
+    parser.add_argument('--debug', action='store_true',
+                        help='Enable debug mode for all algorithms')
+    
+    args = parser.parse_args()
+    
+    # Configuration from arguments
+    workload = args.workload
+    epochs = args.epochs
+    backfill = args.backfill
+    debug = args.debug
     
     # Algorithm configurations: (name, script_file)
     algorithms = [
         ("MaskablePPO", "MaskablePPO.py"),
         ("MaskablePPO_Carbon", "MaskablePPO_Carbon.py"),
         ("MARL", "MARL.py"),
-        ("MARL_Plus", "MARL_Plus.py")
+        ("MARL_Plus", "MARL_plus.py")
     ]
     
     print("="*80)
@@ -204,6 +214,7 @@ def main():
     print(f"\nWorkload: {workload}")
     print(f"Epochs per algorithm: {epochs}")
     print(f"Backfill mode: {backfill}")
+    print(f"Debug mode: {'ENABLED' if debug else 'DISABLED'}")
     print(f"Algorithms to train: {len(algorithms)}")
     for i, (name, _) in enumerate(algorithms, 1):
         print(f"  {i}. {name}")
@@ -246,7 +257,7 @@ def main():
         for i, (name, script) in enumerate(algorithms, 1):
             print(f"\n\n🚀 Starting algorithm {i}/{len(algorithms)}: {name}")
             
-            success = run_algorithm(name, script, workload, epochs, backfill)
+            success = run_algorithm(name, script, workload, epochs, backfill, debug)
             results[name] = success
             
             # Brief pause between algorithms
@@ -277,6 +288,7 @@ def main():
     print(f"Workload: {workload}")
     print(f"Epochs per algorithm: {epochs}")
     print(f"Backfill mode: {backfill}")
+    print(f"Debug mode: {'ENABLED' if debug else 'DISABLED'}")
     print("\nResults:")
     
     successful = 0

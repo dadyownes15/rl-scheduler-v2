@@ -1,40 +1,23 @@
-#!/usr/bin/env python3
+import os
+
+import csv
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.distributions import Categorical
-
-import numpy as np
-import csv
-import copy
-import os
-import scipy.signal
-
 from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
-
-from HPCSimPickJobs import HPCEnv
-from cluster import MAX_QUEUE_SIZE, JOB_FEATURES, RUN_FEATURE, GREEN_FEATURE
-
-MAX_QUEUE_SIZE = 32
-JOB_FEATURES = 7
-RUN_FEATURE = 1
-GREEN_FEATURE = 1
-
-run_win = 3
-green_win = 3
-action2_num = 10
-delayMaxJobNum = 5
-
-eta = 0.002  # weight for bounded slowdown vs carbon reward
+import scipy.signal
+from HPCSimPickJobs import *
 
 class Buffer():
     def __init__(self):
+        self.buffer_num = 0
         self.states = []
-        self.masks1 = []
-        self.masks2 = []
         self.actions1 = []
         self.actions2 = []
+        self.masks1 = []
+        self.masks2 = []
         self.log_probs1 = []
         self.log_probs2 = []
         self.Returns = []
@@ -42,36 +25,39 @@ class Buffer():
         self.job_inputs = []
 
     def clear_buffer(self):
-        self.states.clear()
-        self.masks1.clear()
-        self.masks2.clear()
-        self.actions1.clear()
-        self.actions2.clear()
-        self.log_probs1.clear()
-        self.log_probs2.clear()
-        self.Returns.clear()
-        self.advantages.clear()
-        self.job_inputs.clear()
+        self.buffer_num = 0
+        self.states = []
+        self.actions1 = []
+        self.actions2 = []
+        self.masks1 = []
+        self.masks2 = []
+        self.log_probs1 = []
+        self.log_probs2 = []
+        self.Returns = []
+        self.advantages = []
+        self.job_inputs = []
 
     def store_buffer(self, state, mask1, mask2, action1, action2, log_prob1, log_prob2, Return, advantage, job_input,
                      nums):
-        for i in range(nums):
-            self.states.append(state[i])
-            self.masks1.append(mask1[i])
-            self.masks2.append(mask2[i])
-            self.actions1.append(action1[i])
-            self.actions2.append(action2[i])
-            self.log_probs1.append(log_prob1[i])
-            self.log_probs2.append(log_prob2[i])
-            self.Returns.append(Return[i])
-            self.advantages.append(advantage[i])
-            self.job_inputs.append(job_input[i])
+        self.buffer_num = self.buffer_num + nums
+        self.states.extend(state)
+        self.masks1.extend(mask1)
+        self.masks2.extend(mask2)
+        self.actions1.extend(action1)
+        self.actions2.extend(action2)
+        self.log_probs1.extend(log_prob1)
+        self.log_probs2.extend(log_prob2)
+        self.Returns.extend(Return)
+        self.advantages.extend(advantage)
+        self.job_inputs.extend(job_input)
 
 
 class ActorNet(nn.Module):
 
     def __init__(self, num_inputs1, featureNum1, num_inputs2, featureNum2, num_inputs3, featureNum3):
         super(ActorNet, self).__init__()
+        self.d_model = 128
+
         self.num_inputs1 = num_inputs1
         self.featureNum1 = featureNum1
         self.num_inputs2 = num_inputs2
@@ -79,75 +65,92 @@ class ActorNet(nn.Module):
         self.num_inputs3 = num_inputs3
         self.featureNum3 = featureNum3
 
-        self.conv1 = nn.Conv2d(in_channels=1, out_channels=16, kernel_size=(1, self.featureNum1), stride=(1, 1))
-        self.conv2 = nn.Conv2d(in_channels=1, out_channels=16, kernel_size=(1, self.featureNum2), stride=(1, 1))
-        self.conv3 = nn.Conv2d(in_channels=1, out_channels=16, kernel_size=(1, self.featureNum3), stride=(1, 1))
-        self.conv_11 = nn.Conv2d(in_channels=16, out_channels=32, kernel_size=(self.num_inputs1, 1), stride=(1, 1))
-        self.conv_22 = nn.Conv2d(in_channels=16, out_channels=32, kernel_size=(self.num_inputs2, 1), stride=(1, 1))
-        self.conv_33 = nn.Conv2d(in_channels=16, out_channels=32, kernel_size=(self.num_inputs3, 1), stride=(1, 1))
+        self.embedding = nn.Linear(in_features=JOB_FEATURES, out_features=self.d_model)
+        self.JobEncoder = nn.Sequential(
+            nn.Linear(self.featureNum1, 64),
+            nn.ReLU(),
+            nn.Linear(64, self.d_model),
+            nn.ReLU(),
+        )
 
-        self.conv_3channel_input = nn.Conv2d(in_channels=3, out_channels=64, kernel_size=(1, 32), stride=(1, 1))
-        self.conv_3channel = nn.Conv2d(in_channels=64, out_channels=1, kernel_size=(1, 1), stride=(1, 1))
+        self.GreenEncoder = nn.Sequential(
+            nn.Linear(self.featureNum3, 64),
+            nn.ReLU(),
+            nn.Linear(64, self.d_model),
+            nn.ReLU(),
+        )
 
-        self.conv_selectjob = nn.Conv2d(in_channels=1, out_channels=16, kernel_size=(1, self.featureNum1),
-                                        stride=(1, 1))
-        self.conv_selectjob2 = nn.Conv2d(in_channels=16, out_channels=1, kernel_size=(1, 1), stride=(1, 1))
+        self.RunningJobEncoder = nn.Sequential(
+            nn.Linear(self.featureNum2, 64),
+            nn.ReLU(),
+            nn.Linear(64, self.d_model),
+            nn.ReLU(),
+        )
 
-        # Use adaptive pooling to handle dynamic sequence lengths
-        self.adaptive_pool = nn.AdaptiveAvgPool1d(1)
+        self.decoder1 = nn.Sequential(
+            nn.Linear(self.d_model, 64),
+            nn.ReLU(),
+            nn.Linear(64, 16),
+            nn.ReLU(),
+            nn.Linear(16, 1),
+        )
 
-        self.fc1 = nn.Linear(in_features=1, out_features=32)
-        self.fc2 = nn.Linear(in_features=32, out_features=action2_num)
+        self.hidden = nn.Sequential(
+            nn.Linear(self.d_model, 32),
+            nn.ReLU(),
+            nn.Linear(32, JOB_FEATURES),
+            nn.ReLU()
+        )
+
+        self.flatten = nn.Flatten()
+
+        self.decoder2 = nn.Sequential(
+            nn.Linear((self.num_inputs1 + self.num_inputs2 + self.num_inputs3 + 1) * JOB_FEATURES, 64),
+            nn.ReLU(),
+            nn.Linear(64, action2_num),
+        )
 
     def forward(self, x):
-        out1 = torch.tanh(self.conv1(x[:, :, :self.num_inputs1, :]))
-        out2 = torch.tanh(self.conv2(x[:, :, self.num_inputs1:self.num_inputs1 + self.num_inputs2, :]))
-        out3 = torch.tanh(self.conv3(x[:, :, self.num_inputs1 + self.num_inputs2:, :]))
+        job = x[:, :self.num_inputs1, :self.featureNum1]
+        run = x[:, self.num_inputs1:self.num_inputs1 + self.num_inputs2, :self.featureNum2]
+        green = x[:, self.num_inputs1 + self.num_inputs2:self.num_inputs1 + self.num_inputs2 + self.num_inputs3,
+                :self.featureNum3]
+        job = self.JobEncoder(job)
+        run = self.RunningJobEncoder(run)
+        green = self.GreenEncoder(green)
 
-        out1 = torch.tanh(self.conv_11(out1))
-        out2 = torch.tanh(self.conv_22(out2))
-        out3 = torch.tanh(self.conv_33(out3))
-
-        out1 = out1.view(out1.size(0), out1.size(1), -1)
-        out2 = out2.view(out2.size(0), out2.size(1), -1)
-        out3 = out3.view(out3.size(0), out3.size(1), -1)
-
-        x = torch.cat([out1, out2, out3], dim=1)
-        x = x.unsqueeze(-1)
-        x = torch.tanh(self.conv_3channel_input(x))
-        x = torch.tanh(self.conv_3channel(x))
-        x = x.view(x.size(0), -1)
-        return x
+        return job, run, green
 
     def getActionn1(self, x, mask):
-        x = x.unsqueeze(1)
-        out1 = torch.tanh(self.conv1(x[:, :, :self.num_inputs1, :]))
-        out1 = torch.tanh(self.conv_11(out1))
-        out1 = out1.view(out1.size(0), -1)
-        out1 = out1 + mask * (-1e8)
-        return torch.softmax(out1, dim=-1)
+        encoder_out, _, _ = self.forward(x)
+        logits = self.decoder1(encoder_out)
+
+        logits = logits.squeeze(dim=-1)
+
+        logits = logits - mask * 1e9
+        probs = F.softmax(logits, dim=-1)
+
+        return probs
 
     def getAction2(self, x, mask, job_input):
-        job_input = job_input.unsqueeze(-1)
-        job_input = torch.tanh(self.conv_selectjob(job_input))
-        job_input = torch.tanh(self.conv_selectjob2(job_input))
-        job_input = job_input.view(job_input.size(0), -1)
-        
-        # Use adaptive pooling to handle variable lengths
-        job_input = job_input.unsqueeze(1)  # Add channel dimension for pooling
-        job_input = self.adaptive_pool(job_input)
-        job_input = job_input.squeeze(1)  # Remove channel dimension
-        
-        job_input = torch.tanh(self.fc1(job_input))
-        job_input = self.fc2(job_input)
-        job_input = job_input + mask * (-1e8)
-        return torch.softmax(job_input, dim=-1)
+        job, run, green = self.forward(x)
+        job_input = self.embedding(job_input)
+        encoder_out = torch.cat([job, run, green, job_input], dim=1)
+        encoder_out = self.hidden(encoder_out)
+        encoder_out = self.flatten(encoder_out)
+        logits = self.decoder2(encoder_out)
+        logits = logits - mask * 1e9
+        probs = F.softmax(logits, dim=-1)
+
+        return probs
 
 
 class CriticNet(nn.Module):
 
     def __init__(self, num_inputs1, featureNum1, num_inputs2, featureNum2, num_inputs3, featureNum3):
         super(CriticNet, self).__init__()
+        self.d_model = 128
+
         self.num_inputs1 = num_inputs1
         self.featureNum1 = featureNum1
         self.num_inputs2 = num_inputs2
@@ -155,56 +158,62 @@ class CriticNet(nn.Module):
         self.num_inputs3 = num_inputs3
         self.featureNum3 = featureNum3
 
-        self.conv1 = nn.Conv2d(in_channels=1, out_channels=16, kernel_size=(1, self.featureNum1), stride=(1, 1))
-        self.conv2 = nn.Conv2d(in_channels=1, out_channels=16, kernel_size=(1, self.featureNum2), stride=(1, 1))
-        self.conv3 = nn.Conv2d(in_channels=1, out_channels=16, kernel_size=(1, self.featureNum3), stride=(1, 1))
-        self.conv_11 = nn.Conv2d(in_channels=16, out_channels=32, kernel_size=(self.num_inputs1, 1), stride=(1, 1))
-        self.conv_22 = nn.Conv2d(in_channels=16, out_channels=32, kernel_size=(self.num_inputs2, 1), stride=(1, 1))
-        self.conv_33 = nn.Conv2d(in_channels=16, out_channels=32, kernel_size=(self.num_inputs3, 1), stride=(1, 1))
+        self.JobEncoder = nn.Sequential(
+            nn.Linear(self.featureNum1, 64),
+            nn.ReLU(),
+            nn.Linear(64, self.d_model),
+            nn.ReLU(),
+        )
 
-        self.conv_3channel_input = nn.Conv2d(in_channels=3, out_channels=64, kernel_size=(1, 32), stride=(1, 1))
-        self.conv_3channel = nn.Conv2d(in_channels=64, out_channels=1, kernel_size=(1, 1), stride=(1, 1))
+        self.GreenEncoder = nn.Sequential(
+            nn.Linear(self.featureNum3, 64),
+            nn.ReLU(),
+            nn.Linear(64, self.d_model),
+            nn.ReLU(),
+        )
 
-        # Use adaptive pooling to handle dynamic sequence lengths
-        self.adaptive_pool = nn.AdaptiveAvgPool1d(1)
+        self.RunningJobEncoder = nn.Sequential(
+            nn.Linear(self.featureNum2, 64),
+            nn.ReLU(),
+            nn.Linear(64, self.d_model),
+            nn.ReLU(),
+        )
 
-        self.fc1 = nn.Linear(in_features=1, out_features=32)
-        self.fc2 = nn.Linear(in_features=32, out_features=16)
-        self.fc3 = nn.Linear(in_features=16, out_features=1)
+        self.hidden = nn.Sequential(
+            nn.Linear(self.d_model, 32),
+            nn.ReLU(),
+            nn.Linear(32, JOB_FEATURES),
+            nn.ReLU()
+        )
+
+        self.out = nn.Sequential(
+            nn.Linear((self.num_inputs1 + self.num_inputs2 + self.num_inputs3) * JOB_FEATURES, 64),
+            nn.ReLU(),
+            nn.Linear(64, 8),
+            nn.ReLU(),
+            nn.Linear(8, 1)
+        )
+        self.flatten = nn.Flatten()
 
     def forward(self, x):
-        x = x.unsqueeze(1)
-        out1 = torch.tanh(self.conv1(x[:, :, :self.num_inputs1, :]))
-        out2 = torch.tanh(self.conv2(x[:, :, self.num_inputs1:self.num_inputs1 + self.num_inputs2, :]))
-        out3 = torch.tanh(self.conv3(x[:, :, self.num_inputs1 + self.num_inputs2:, :]))
+        job = x[:, :self.num_inputs1, :self.featureNum1]
+        run = x[:, self.num_inputs1:self.num_inputs1 + self.num_inputs2, :self.featureNum2]
+        green = x[:, self.num_inputs1 + self.num_inputs2:self.num_inputs1 + self.num_inputs2 + self.num_inputs3,
+                :self.featureNum3]
+        green = self.GreenEncoder(green)
+        job = self.JobEncoder(job)
+        run = self.RunningJobEncoder(run)
+        con = torch.cat([job, run, green], dim=1)
 
-        out1 = torch.tanh(self.conv_11(out1))
-        out2 = torch.tanh(self.conv_22(out2))
-        out3 = torch.tanh(self.conv_33(out3))
-
-        out1 = out1.view(out1.size(0), out1.size(1), -1)
-        out2 = out2.view(out2.size(0), out2.size(1), -1)
-        out3 = out3.view(out3.size(0), out3.size(1), -1)
-
-        x = torch.cat([out1, out2, out3], dim=1)
-        x = x.unsqueeze(-1)
-        x = torch.tanh(self.conv_3channel_input(x))
-        x = torch.tanh(self.conv_3channel(x))
-        x = x.view(x.size(0), -1)
-        
-        # Use adaptive pooling to handle variable lengths
-        x = x.unsqueeze(1)  # Add channel dimension for pooling
-        x = self.adaptive_pool(x)
-        x = x.squeeze(1)  # Remove channel dimension
-        
-        x = torch.tanh(self.fc1(x))
-        x = torch.tanh(self.fc2(x))
-        x = self.fc3(x)
-        return x
+        con = self.hidden(con)
+        con = self.flatten(con)
+        value = self.out(con)
+        return value
 
 
 class PPO():
-    def __init__(self, batch_size=10, inputNum_size=[], featureNum_size=[], device='cpu'):
+    def __init__(self, batch_size=10, inputNum_size=[], featureNum_size=[],
+                 device='cpu'):
         super(PPO, self).__init__()
         self.num_inputs1 = inputNum_size[0]
         self.num_inputs2 = inputNum_size[1]
@@ -234,6 +243,7 @@ class PPO():
         self.values = []
         self.masks1 = []
         self.masks2 = []
+        self.entropys = []
         self.job_inputs = []
         self.buffer = Buffer()
 
@@ -243,25 +253,23 @@ class PPO():
 
         self.entropy_coefficient = 0
 
-        self.actor_optimizer = optim.Adam(
-            self.actor_net.parameters(), lr=0.0001, eps=1e-6)
-        self.critic_net_optimizer = optim.Adam(
-            self.critic_net.parameters(), lr=0.0005, eps=1e-6)
+        self.actor_optimizer = optim.Adam(self.actor_net.parameters(), lr=1e-4)
+        self.critic_net_optimizer = optim.Adam(self.critic_net.parameters(), lr=1e-4)
 
     def choose_action(self, state, mask1, mask2):
-        with torch.no_grad():
-            probs1 = self.actor_net.getActionn1(state, mask1)
+        probs1 = self.actor_net.getActionn1(state, mask1)
         dist_bin1 = Categorical(probs=probs1)
         ac1 = dist_bin1.sample()
         log_prob1 = dist_bin1.log_prob(ac1)
+
         job_input = state[:, ac1]
-        with torch.no_grad():
-            probs2 = self.actor_net.getAction2(state, mask2, job_input)
+        probs2 = self.actor_net.getAction2(state, mask2, job_input)
         dist_bin2 = Categorical(probs=probs2)
         ac2 = dist_bin2.sample()
         log_prob2 = dist_bin2.log_prob(ac2)
 
         value = self.critic_net(state)
+
         return ac1, log_prob1, ac2, log_prob2, value, job_input
 
     def act_job(self, state, mask1, ac1):
@@ -269,7 +277,6 @@ class PPO():
         dist_bin1 = Categorical(probs=probs1)
         log_prob1 = dist_bin1.log_prob(ac1)
         entropy1 = dist_bin1.entropy()
-
         return log_prob1, entropy1
 
     def act_exc(self, state, mask2, job_input, ac2):
@@ -280,12 +287,10 @@ class PPO():
         return log_prob2, entropy2
 
     def normalize(self, advantages):
-        nor_advantages = (advantages - torch.mean(advantages)) / (
-                torch.std(advantages) + 1e-9)
-        return nor_advantages
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        return advantages
 
     def remember(self, state, value, log_prob1, log_prob2, action1, action2, reward, mask1, mask2, device, job_input):
-        # KEY CHANGE: Store combined reward (eta * wait_reward + green_reward) in step-wise trajectory
         self.rewards_seq.append(reward)
         self.states.append(state.to("cpu"))
         self.log_probs1.append(log_prob1.to("cpu"))
@@ -379,13 +384,14 @@ class PPO():
         masks1 = torch.cat(self.buffer.masks1, dim=0)
         masks2 = torch.cat(self.buffer.masks2, dim=0)
         actions1 = torch.cat(self.buffer.actions1, dim=0)
-        actions2 = torch.cat(self.buffer.actions2, dim=0)
         log_probs1 = torch.cat(self.buffer.log_probs1, dim=0)
+        actions2 = torch.cat(self.buffer.actions2, dim=0)
         log_probs2 = torch.cat(self.buffer.log_probs2, dim=0)
         job_inputs = torch.cat(self.buffer.job_inputs, dim=0)
         returns = torch.tensor(self.buffer.Returns)
         advantages = torch.tensor(self.buffer.advantages)
         advantages = self.normalize(advantages)
+
         for i in range(self.ppo_update_time):
             for index in BatchSampler(SubsetRandomSampler(range(len(self.buffer.states))), self.batch_size, False):
                 index_tensor = torch.tensor(index)
@@ -393,27 +399,27 @@ class PPO():
                 sampled_masks1 = torch.index_select(masks1, dim=0, index=index_tensor).to(self.device)
                 sampled_masks2 = torch.index_select(masks2, dim=0, index=index_tensor).to(self.device)
                 sampled_actions1 = torch.index_select(actions1, dim=0, index=index_tensor).to(self.device)
-                sampled_actions2 = torch.index_select(actions2, dim=0, index=index_tensor).to(self.device)
                 sampled_log_probs1 = torch.index_select(log_probs1, dim=0, index=index_tensor).to(self.device)
+                sampled_actions2 = torch.index_select(actions2, dim=0, index=index_tensor).to(self.device)
                 sampled_log_probs2 = torch.index_select(log_probs2, dim=0, index=index_tensor).to(self.device)
-                sampled_job_input = torch.index_select(job_inputs, dim=0, index=index_tensor).to(self.device)
                 sampled_returns = torch.index_select(returns, dim=0, index=index_tensor).to(self.device)
                 sampled_advantages = torch.index_select(advantages, dim=0, index=index_tensor).to(self.device)
-                action_loss, polic_loss, entropy_loss = self.compute_actor_loss(sampled_states, sampled_masks1,
-                                                                                sampled_masks2, sampled_actions1,
-                                                                                sampled_actions2, sampled_advantages,
-                                                                                sampled_log_probs1, sampled_log_probs2,
-                                                                                sampled_job_input)
-                value_loss = self.compute_value_loss(sampled_states, sampled_returns)
+                sampled_job_inputs = torch.index_select(job_inputs, dim=0, index=index_tensor).to(self.device)
 
                 self.actor_optimizer.zero_grad()
-                self.critic_net_optimizer.zero_grad()
-
+                action_loss, polic_loss, entropy_loss = self.compute_actor_loss(sampled_states, sampled_masks1,
+                                                                                sampled_masks2,
+                                                                                sampled_actions1, sampled_actions2,
+                                                                                sampled_advantages,
+                                                                                sampled_log_probs1, sampled_log_probs2,
+                                                                                sampled_job_inputs)
                 action_loss.backward()
                 nn.utils.clip_grad_norm_(
                     self.actor_net.parameters(), self.max_grad_norm)
                 self.actor_optimizer.step()
 
+                self.critic_net_optimizer.zero_grad()
+                value_loss = self.compute_value_loss(sampled_states, sampled_returns)
                 value_loss.backward()
                 nn.utils.clip_grad_norm_(
                     self.critic_net.parameters(), self.max_grad_norm)
@@ -423,21 +429,25 @@ class PPO():
         if not os.path.exists(model_name_path):
             os.makedirs(model_name_path)
         torch.save(self.actor_net.state_dict(), model_name_path + "_actor.pkl")
-        torch.save(self.critic_net.state_dict(), model_name_path + "_critic.pkl")
+        torch.save(self.critic_net.state_dict(),
+                   model_name_path + "_critic.pkl")
 
     def load_using_model_name(self, model_name_path):
-        self.actor_net.load_state_dict(torch.load(model_name_path + "_actor.pkl"))
-        self.critic_net.load_state_dict(torch.load(model_name_path + "_critic.pkl"))
+        self.actor_net.load_state_dict(
+            torch.load(model_name_path + "_actor.pkl"))
+        self.critic_net.load_state_dict(
+            torch.load(model_name_path + "_critic.pkl"))
 
-    def eval_action(self, o, mask1, mask2):
+    def eval_action(self,o,mask1,mask2):
         with torch.no_grad():
             o = o.reshape(1, MAX_QUEUE_SIZE + run_win + green_win, JOB_FEATURES)
             state = torch.FloatTensor(o).to(self.device)
             mask1 = np.array(mask1).reshape(1, MAX_QUEUE_SIZE)
             mask1 = torch.FloatTensor(mask1).to(self.device)
-            mask2 = np.array(mask2).reshape(1, action2_num)
+            mask2 = mask2.reshape(1, action2_num)
             mask2 = torch.FloatTensor(mask2).to(self.device)
-            probs1 = self.actor_net.getActionn1(state, mask1)
+
+            probs1 = self.actor_net.getActionn1(state,mask1)
             dist_bin1 = Categorical(probs=probs1)
             ac1 = dist_bin1.sample()
             job_input = state[:, ac1]
@@ -446,35 +456,62 @@ class PPO():
             ac2 = dist_bin2.sample()
 
         return ac1, ac2
-
-
+        
 def train(workload, backfill, debug=False):
+    print("Training MARL Plus called")
     # ------------------------------------------------------------------
     # 1. Experiment-wide hyper-parameters & environment construction
     # ------------------------------------------------------------------
-    seed         = 0
-    epochs       = 300
-    traj_num     = 100
+    seed       = 0
+    epochs     = 300          # how many training loops over the dataset
+    traj_num   = 100          # trajectories per epoch (episodes)
     
-    env = HPCEnv(backfill=backfill)
-    env.seed(seed)
+    if debug:
+        print(f"DEBUG: Training parameters:")
+        print(f"  Workload: {workload}")
+        print(f"  Backfill: {backfill}")
+        print(f"  Epochs: {epochs}")
+        print(f"  Trajectories per epoch: {traj_num}")
+        print(f"  Seed: {seed}")
     
-    current_dir     = os.getcwd()
-    workload_name   = workload
-    workload_file   = os.path.join(current_dir, f"./data/{workload_name}.swf")
-    env.my_init(workload_file=workload_file)
+    env = HPCEnv(backfill=backfill, debug=debug)  # custom cluster-scheduling env
+    env.seed(seed)                  # reproducible RNG for env
+    current_dir   = os.getcwd()
+    workload_file = os.path.join(current_dir, "data", f"{workload}.swf")
     
+    # Check if the specified workload file exists
+    if not os.path.exists(workload_file):
+        print(f"ERROR: Workload file not found: {workload_file}")
+        print(f"Available workload files in data/:")
+        data_dir = os.path.join(current_dir, "data")
+        if os.path.exists(data_dir):
+            swf_files = [f for f in os.listdir(data_dir) if f.endswith('.swf')]
+            for swf_file in sorted(swf_files):
+                print(f"  {swf_file}")
+        exit(1)
+    
+    print(f"Using workload: {workload_file}")
+    env.my_init(workload_file=workload_file)  # load the SWF trace
+    
+    if debug:
+        print(f"DEBUG: Workload loaded successfully")
+        print(f"  Number of jobs: {env.loads.size()}")
+        print(f"  Max execution time: {env.loads.max_exec_time}")
+        print(f"  Max processors: {env.loads.max_procs}")
+        # Check first job's carbon consideration
+        if env.loads.size() > 0:
+            first_job = env.loads[0]
+            print(f"  First job carbon consideration: {first_job.carbon_consideration}")
+            print(f"  Job features: {JOB_FEATURES}")
+    
+    # ------------------------------------------------------------------
+    # 2. Device selection (GPU if available)
+    # ------------------------------------------------------------------
     use_cuda = torch.cuda.is_available()
     device   = torch.device("cuda" if use_cuda else "cpu")
     
-    if debug:
-        print(f"DEBUG: Using device: {device}")
-        print(f"DEBUG: Workload: {workload_name}")
-        print(f"DEBUG: Backfill mode: {backfill}")
-        print(f"DEBUG: Training for {epochs} epochs with {traj_num} trajectories each")
-    
     # ------------------------------------------------------------------
-    # 2. PPO agent setup 
+    # 3. PPO agent creation
     # ------------------------------------------------------------------
     inputNum_size    = [MAX_QUEUE_SIZE, run_win, green_win]       # grid dims
     featureNum_size  = [JOB_FEATURES,   RUN_FEATURE, GREEN_FEATURE]
@@ -565,7 +602,8 @@ def train(workload, backfill, debug=False):
                 action1, log_prob1, action2, log_prob2, value, job_input = \
                     ppo.choose_action(state, mask1T, mask2T)
             
-            # KEY CHANGE: Store combined reward (eta * r + greenRwd) in step-wise trajectory
+            # KEY CHANGE: Store COMBINED reward (eta * r + greenRwd) instead of just greenRwd
+            # This is the main difference from MARL.py - both wait time and carbon reward in step rewards
             combined_reward = eta * r + greenRwd
             ppo.remember(
                 state, value, log_prob1, log_prob2, action1,
@@ -577,13 +615,12 @@ def train(workload, backfill, debug=False):
             # ----------------------------------------------------------
             if debug and t < 3 and ep_len < 5:  # Only debug first few steps of first trajectories
                 print(f"    Action1: {action1.item()}, Action2: {action2.item()}")
-                print(f"    Combined reward stored: {combined_reward:.4f} (eta*r={eta*r:.4f} + greenRwd={greenRwd:.4f})")
                 
             o, r, d, r2, sjf_t, f1_t, running_num, greenRwd = \
                 env.step(action1.item(), action2.item())
                 
             if debug and t < 3 and ep_len < 5:
-                print(f"    Reward: {r:.4f}, Green reward: {greenRwd:.4f}, Done: {d}")
+                print(f"    Wait reward: {r:.4f}, Green reward: {greenRwd:.4f}, Combined: {eta * r + greenRwd:.4f}, Done: {d}")
             
             # Trajectory-level bookkeeping
             ep_ret   += r
@@ -605,7 +642,7 @@ def train(workload, backfill, debug=False):
                     print(f"  DEBUG: Episode {t + 1} completed, episode return: {ep_ret:.4f}, steps: {ep_len}")
                     
                 t += 1                                     # finished a trajectory
-                ppo.storeIntoBuffter(eta * r + greenRwd)   # final R for GAE (same as step-wise)
+                ppo.storeIntoBuffter(eta * r + greenRwd)   # final R for GAE
                 ppo.clear_memory()                         # reset per-traj state
                 
                 # reset env for next trajectory

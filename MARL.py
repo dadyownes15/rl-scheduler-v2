@@ -462,6 +462,7 @@ class PPO():
         return ac1, ac2
         
 def train(workload, backfill, debug=False):
+    print("Traing called")
     # ------------------------------------------------------------------
     # 1. Experiment-wide hyper-parameters & environment construction
     # ------------------------------------------------------------------
