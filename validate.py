@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Validation script for MARL experiments.
-Loads trained weights and runs detailed job-level evaluation.
+Enhanced validation script for MARL experiments with comprehensive job tracking.
+Fixes critical issues: job completion tracking, carbon emissions per job, and proper data logging.
 """
 
 import pandas as pd
@@ -15,12 +15,14 @@ from HPCSimPickJobs import *
 from MARL import PPO as MARL
 
 
-def load_marl_model(experiment_path):
+def load_marl_model(experiment_path, workload_arg=None, epoch=None):
     """
     Load MARL model from experiment directory.
     
     Args:
-        experiment_path: Path to experiment directory (e.g., "lublin_256/MARL_ED12")
+        experiment_path: Experiment name (e.g., "MARL_basic", "basic") or full path
+        workload_arg: Workload name or file path (e.g., "lublin_256_carbon_float" or "./data/lublin_256_carbon_float.swf")
+        epoch: Epoch number to load weights from (if None, loads from final/)
     
     Returns:
         Loaded MARL model
@@ -33,26 +35,88 @@ def load_marl_model(experiment_path):
     model = MARL(batch_size=256, inputNum_size=inputNum_size,
                  featureNum_size=featureNum_size, device=device)
     
-    # Try to load from final weights, fallback to legacy location
-    weights_path = f"{experiment_path}/final/"
-    if not os.path.exists(f"{weights_path}_actor.pkl"):
-        # Try legacy location
-        workload = experiment_path.split('/')[0]
-        weights_path = f"{workload}/MARL/"
+    # Auto-detect experiment path if only experiment name is provided
+    if '/' not in experiment_path and workload_arg:
+        # Extract workload name from argument
+        if workload_arg.endswith('.swf'):
+            # It's a file path like "./data/lublin_256_carbon_float.swf"
+            workload_name = os.path.basename(workload_arg).replace('.swf', '')
+        else:
+            # It's just a workload name like "lublin_256_carbon_float"
+            workload_name = workload_arg
+        
+        # Handle experiment name - check if it already has MARL_ prefix
+        if experiment_path.startswith('MARL_'):
+            # Already has prefix, use as-is
+            full_experiment_path = f"{workload_name}/{experiment_path}"
+        else:
+            # Add MARL_ prefix
+            full_experiment_path = f"{workload_name}/MARL_{experiment_path}"
+        
+        if os.path.exists(full_experiment_path):
+            experiment_path = full_experiment_path
+            print(f"Auto-detected experiment path: {experiment_path}")
+        else:
+            print(f"Warning: Could not auto-detect path for experiment '{experiment_path}', using as provided")
+    
+    # Determine weights path based on epoch
+    if epoch is not None:
+        # Load from specific epoch checkpoint
+        weights_path = f"{experiment_path}/checkpoints/epoch_{epoch}/"
         if not os.path.exists(f"{weights_path}_actor.pkl"):
-            raise FileNotFoundError(f"No trained weights found in {experiment_path}")
+            # List available epochs to help user
+            checkpoints_dir = f"{experiment_path}/checkpoints"
+            if os.path.exists(checkpoints_dir):
+                available_epochs = []
+                for item in os.listdir(checkpoints_dir):
+                    if item.startswith('epoch_') and os.path.isdir(f"{checkpoints_dir}/{item}"):
+                        epoch_num = item.replace('epoch_', '')
+                        if os.path.exists(f"{checkpoints_dir}/{item}/_actor.pkl"):
+                            available_epochs.append(epoch_num)
+                available_epochs.sort(key=int)
+                print(f"Available epochs in {checkpoints_dir}/:")
+                for epoch_num in available_epochs:
+                    print(f"  - epoch_{epoch_num}")
+            raise FileNotFoundError(f"No trained weights found for epoch {epoch} in {experiment_path}/checkpoints/")
+    else:
+        # Load from final weights, fallback to legacy location
+        weights_path = f"{experiment_path}/final/"
+        if not os.path.exists(f"{weights_path}_actor.pkl"):
+            # Try legacy location
+            workload = experiment_path.split('/')[0]
+            weights_path = f"{workload}/MARL/"
+            if not os.path.exists(f"{weights_path}_actor.pkl"):
+                # List available experiments to help user
+                if workload_arg:
+                    # Extract workload name for listing
+                    if workload_arg.endswith('.swf'):
+                        workload_name = os.path.basename(workload_arg).replace('.swf', '')
+                    else:
+                        workload_name = workload_arg
+                        
+                    print(f"Available experiments in {workload_name}/:")
+                    if os.path.exists(workload_name):
+                        experiments = [d for d in os.listdir(workload_name) if d.startswith('MARL_')]
+                        for exp in experiments:
+                            print(f"  - {exp}")
+                raise FileNotFoundError(f"No trained weights found in {experiment_path}")
     
     print(f"Loading weights from: {weights_path}")
     model.load_using_model_name(weights_path)
+    
+    # Store the final experiment path for later use
+    model._experiment_path = experiment_path
+    
     return model
 
 
-class JobTracker:
-    """Track detailed job-level information during validation"""
+class EnhancedJobTracker:
+    """Enhanced job tracker with comprehensive completion and carbon tracking"""
     
     def __init__(self):
         self.jobs_data = []
         self.episode_data = []
+        self.job_id_to_index = {}  # Map job_id to index for faster lookup
         
     def record_job_submission(self, job, queue_length, current_time):
         """Record job when it's submitted to the queue"""
@@ -74,58 +138,121 @@ class JobTracker:
             'action1': None,
             'action2': None,
             'scheduled': False,
+            'completed': False,
             'carbon_emissions': None,
             'carbon_reward': None
         }
+        job_index = len(self.jobs_data)
         self.jobs_data.append(job_info)
-        return len(self.jobs_data) - 1  # Return index for later updates
+        self.job_id_to_index[job.job_id] = job_index
+        return job_index
     
-    def update_job_scheduling(self, job_index, scheduled_time, action1, action2, carbon_emissions=None, carbon_reward=None):
-        """Update job info when it gets scheduled"""
+    def update_job_scheduling(self, job_index, job, scheduled_time, action1, action2):
+        """Update job info when it gets scheduled with enhanced carbon calculation"""
         if job_index < len(self.jobs_data):
+            # Convert tensor actions to plain numbers
+            a1_val = action1.item() if hasattr(action1, 'item') else int(action1)
+            a2_val = action2.item() if hasattr(action2, 'item') else int(action2)
+            
+            # Calculate individual job carbon emissions
+            start_time = scheduled_time
+            end_time = start_time + job.request_time
+            
+            # Create temporary single-job list for carbon calculation
+            temp_job_list = [job]
+            
+            # Get carbon intensity object from environment (passed during initialization)
+            if hasattr(self, 'carbon_intensity'):
+                carbon_emissions = self.carbon_intensity.getCarbonEmissions(
+                    job.power, start_time, end_time
+                )
+                
+                # Calculate individual job carbon reward
+                individual_carbon_reward = self.carbon_intensity.getCarbonAwareReward(temp_job_list)
+            else:
+                carbon_emissions = 0.0
+                individual_carbon_reward = 0.0
+            
             self.jobs_data[job_index].update({
                 'scheduled_time': scheduled_time,
                 'wait_time': scheduled_time - self.jobs_data[job_index]['submit_time'],
-                'action1': action1,
-                'action2': action2,
+                'action1': a1_val,
+                'action2': a2_val,
                 'scheduled': True,
                 'carbon_emissions': carbon_emissions,
-                'carbon_reward': carbon_reward
+                'carbon_reward': individual_carbon_reward
             })
     
-    def update_job_completion(self, job_index, completion_time, actual_runtime):
-        """Update job info when it completes"""
-        if job_index < len(self.jobs_data):
+    def update_job_completion(self, job_id, completion_time, actual_runtime):
+        """Update job info when it completes - now uses job_id for direct lookup"""
+        if job_id in self.job_id_to_index:
+            job_index = self.job_id_to_index[job_id]
             self.jobs_data[job_index].update({
                 'completion_time': completion_time,
-                'actual_runtime': actual_runtime
+                'actual_runtime': actual_runtime,
+                'completed': True
             })
+    
+    def set_carbon_intensity(self, carbon_intensity):
+        """Set carbon intensity object for calculations"""
+        self.carbon_intensity = carbon_intensity
+    
+    def track_running_jobs_completion(self, env):
+        """Track completion of currently running jobs based on their end times"""
+        current_time = env.current_timestamp
+        
+        for job in env.running_jobs:
+            job_end_time = job.scheduled_time + job.request_time
+            if job_end_time <= current_time:
+                # Job should be completed by now
+                actual_runtime = job.request_time  # In simulation, actual = requested
+                self.update_job_completion(job.job_id, job_end_time, actual_runtime)
+    
+    def finalize_remaining_jobs(self, env):
+        """Mark remaining scheduled jobs as completed at episode end"""
+        for job in env.loads.all_jobs:
+            if (hasattr(job, 'scheduled_time') and job.scheduled_time != -1 and 
+                job.job_id in self.job_id_to_index):
+                
+                job_data = self.jobs_data[self.job_id_to_index[job.job_id]]
+                if not job_data['completed']:
+                    completion_time = job.scheduled_time + job.request_time
+                    actual_runtime = job.request_time
+                    self.update_job_completion(job.job_id, completion_time, actual_runtime)
     
     def record_episode_summary(self, episode_num, total_reward, green_reward, jobs_completed, makespan):
         """Record episode-level summary"""
+        completed_jobs = [j for j in self.jobs_data if j['completed']]
+        avg_wait_time = np.mean([j['wait_time'] for j in completed_jobs if j['wait_time'] is not None])
+        
         self.episode_data.append({
             'episode': episode_num,
             'total_reward': total_reward,
             'green_reward': green_reward,
             'jobs_completed': jobs_completed,
+            'jobs_scheduled': len([j for j in self.jobs_data if j['scheduled']]),
+            'jobs_actually_completed': len(completed_jobs),
             'makespan': makespan,
-            'avg_wait_time': np.mean([j['wait_time'] for j in self.jobs_data if j['wait_time'] is not None])
+            'avg_wait_time': avg_wait_time
         })
 
 
-def run_marl_validation(model, env, tracker, episode_num):
+def run_enhanced_marl_validation(model, env, tracker, episode_num):
     """
-    Run a single validation episode with detailed tracking.
+    Run a single validation episode with enhanced tracking.
     
     Args:
         model: Loaded MARL model
         env: HPC environment
-        tracker: JobTracker instance
+        tracker: EnhancedJobTracker instance
         episode_num: Episode number for tracking
     
     Returns:
         (total_reward, green_reward, jobs_completed)
     """
+    # Set carbon intensity for tracker
+    tracker.set_carbon_intensity(env.cluster.carbonIntensity)
+    
     o = env.build_observation()
     running_num = 0
     total_reward = 0
@@ -138,6 +265,9 @@ def run_marl_validation(model, env, tracker, episode_num):
     step_count = 0
     while True:
         step_count += 1
+        
+        # Track completion of running jobs before processing new ones
+        tracker.track_running_jobs_completion(env)
         
         # Track new jobs in queue that we haven't seen before
         for job in env.job_queue:
@@ -180,13 +310,11 @@ def run_marl_validation(model, env, tracker, episode_num):
         # Step environment
         o, r, d, r2, sjf_t, f1_t, running_num, greenRwd = env.step(a1, a2)
         
-        # Update tracking for scheduled job
+        # Update tracking for scheduled job with enhanced information
         if selected_job and selected_job in job_indices:
             job_idx = job_indices[selected_job]
             tracker.update_job_scheduling(
-                job_idx, env.current_timestamp, a1, a2, 
-                carbon_emissions=None,  # Could extract from env if available
-                carbon_reward=greenRwd
+                job_idx, selected_job, env.current_timestamp, a1, a2
             )
         
         total_reward += r
@@ -199,6 +327,9 @@ def run_marl_validation(model, env, tracker, episode_num):
         if step_count % 100 == 0:
             print(f"    Step {step_count}, queue size: {len(env.job_queue)}, running: {running_num}")
     
+    # Finalize remaining jobs at episode end
+    tracker.finalize_remaining_jobs(env)
+    
     # Record episode summary
     makespan = env.current_timestamp - env.start_timestamp if hasattr(env, 'start_timestamp') else 0
     tracker.record_episode_summary(episode_num, total_reward, green_reward, jobs_completed, makespan)
@@ -208,160 +339,188 @@ def run_marl_validation(model, env, tracker, episode_num):
     return total_reward, green_reward, jobs_completed
 
 
-def save_validation_results(tracker, experiment_path, workload, episodes):
-    """Save detailed validation results to CSV files"""
+def save_enhanced_validation_results(tracker, experiment_path, workload, episodes, epoch=None):
+    """Save enhanced validation results with comprehensive job completion data"""
     
-    # Create validation results directory
-    results_dir = f"{experiment_path}/validation_results"
+    # Create validation results directory with epoch subfolder
+    if epoch is not None:
+        results_dir = f"{experiment_path}/validation_results/epoch_{epoch}"
+    else:
+        results_dir = f"{experiment_path}/validation_results/final"
     os.makedirs(results_dir, exist_ok=True)
     
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
     # Save job-level data
-    jobs_file = f"{results_dir}/job_details_{timestamp}.csv"
+    jobs_file = f"{results_dir}/job_details_enhanced.csv"
     if tracker.jobs_data:
         jobs_df = pd.DataFrame(tracker.jobs_data)
         jobs_df.to_csv(jobs_file, index=False)
-        print(f"Job details saved to: {jobs_file}")
+        print(f"Enhanced job details saved to: {jobs_file}")
         
-        # Print summary statistics
-        completed_jobs = jobs_df[jobs_df['scheduled'] == True]
+        # Print comprehensive statistics
+        all_jobs = jobs_df
+        scheduled_jobs = jobs_df[jobs_df['scheduled'] == True]
+        completed_jobs = jobs_df[jobs_df['completed'] == True]
+        
+        print(f"\nEnhanced Job Statistics:")
+        print(f"  Total jobs tracked: {len(all_jobs)}")
+        print(f"  Jobs scheduled: {len(scheduled_jobs)}")
+        print(f"  Jobs completed: {len(completed_jobs)}")
+        
+        if len(scheduled_jobs) > 0:
+            print(f"  Average wait time: {scheduled_jobs['wait_time'].mean():.2f}s")
+            
+            # Carbon consideration analysis
+            carbon_values = scheduled_jobs['carbon_consideration']
+            print(f"  Carbon consideration stats:")
+            print(f"    Min: {carbon_values.min():.3f}")
+            print(f"    Max: {carbon_values.max():.3f}")
+            print(f"    Mean: {carbon_values.mean():.3f}")
+            print(f"    Std: {carbon_values.std():.3f}")
+            
+            # Show distribution in bins
+            bins = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+            bin_labels = ["0.0-0.2", "0.2-0.4", "0.4-0.6", "0.6-0.8", "0.8-1.0"]
+            for i, (low, high) in enumerate(zip(bins[:-1], bins[1:])):
+                count = len(carbon_values[(carbon_values >= low) & (carbon_values < high)])
+                if i == len(bins) - 2:  # Last bin, include upper bound
+                    count = len(carbon_values[(carbon_values >= low) & (carbon_values <= high)])
+                print(f"    {bin_labels[i]}: {count} jobs ({count/len(scheduled_jobs)*100:.1f}%)")
+        
         if len(completed_jobs) > 0:
-            print(f"\nJob Statistics:")
-            print(f"  Total jobs tracked: {len(jobs_df)}")
-            print(f"  Jobs scheduled: {len(completed_jobs)}")
-            print(f"  Average wait time: {completed_jobs['wait_time'].mean():.2f}s")
-                         print(f"  Carbon consideration distribution:")
-             carbon_values = completed_jobs['carbon_consideration']
-             print(f"    Min: {carbon_values.min():.3f}")
-             print(f"    Max: {carbon_values.max():.3f}")
-             print(f"    Mean: {carbon_values.mean():.3f}")
-             print(f"    Std: {carbon_values.std():.3f}")
-             
-             # Show distribution in bins
-             bins = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
-             bin_labels = ["0.0-0.2", "0.2-0.4", "0.4-0.6", "0.6-0.8", "0.8-1.0"]
-             for i, (low, high) in enumerate(zip(bins[:-1], bins[1:])):
-                 count = len(carbon_values[(carbon_values >= low) & (carbon_values < high)])
-                 if i == len(bins) - 2:  # Last bin, include upper bound
-                     count = len(carbon_values[(carbon_values >= low) & (carbon_values <= high)])
-                 print(f"    {bin_labels[i]}: {count} jobs ({count/len(completed_jobs)*100:.1f}%)")
-    
+            # Carbon emissions analysis
+            emissions_data = completed_jobs['carbon_emissions'].dropna()
+            if len(emissions_data) > 0:
+                print(f"  Carbon emissions stats:")
+                print(f"    Total emissions: {emissions_data.sum():.2f} gCO2eq")
+                print(f"    Mean per job: {emissions_data.mean():.2f} gCO2eq")
+                print(f"    Std: {emissions_data.std():.2f} gCO2eq")
+            
+            # Carbon reward analysis
+            reward_data = completed_jobs['carbon_reward'].dropna()
+            reward_data = reward_data[reward_data != 0]  # Exclude zero rewards
+            if len(reward_data) > 0:
+                print(f"  Carbon reward stats (non-zero):")
+                print(f"    Mean: {reward_data.mean():.4f}")
+                print(f"    Std: {reward_data.std():.4f}")
+                print(f"    Min: {reward_data.min():.4f}")
+                print(f"    Max: {reward_data.max():.4f}")
+            
+            # Completion analysis
+            print(f"  Completion analysis:")
+            print(f"    Jobs with completion data: {len(completed_jobs)}")
+            print(f"    Completion rate: {len(completed_jobs)/len(scheduled_jobs)*100:.1f}%")
+
     # Save episode-level data
-    episodes_file = f"{results_dir}/episode_summary_{timestamp}.csv"
+    episodes_file = f"{results_dir}/episode_summary_enhanced.csv"
     if tracker.episode_data:
         episodes_df = pd.DataFrame(tracker.episode_data)
         episodes_df.to_csv(episodes_file, index=False)
-        print(f"Episode summary saved to: {episodes_file}")
-        
-        # Print episode statistics
-        print(f"\nEpisode Statistics:")
-        print(f"  Episodes completed: {len(episodes_df)}")
-        print(f"  Average total reward: {episodes_df['total_reward'].mean():.2f}")
-        print(f"  Average green reward: {episodes_df['green_reward'].mean():.2f}")
-        print(f"  Average jobs per episode: {episodes_df['jobs_completed'].mean():.1f}")
+        print(f"Enhanced episode summary saved to: {episodes_file}")
 
 
 def main():
+    """Enhanced main function with improved job tracking"""
     import argparse
     
-    parser = argparse.ArgumentParser(description="Validate MARL experiment with detailed job tracking")
-    parser.add_argument('--workload', type=str, default='lublin_256', 
-                       help='Workload dataset name')
-    parser.add_argument('--experiment', type=str, required=True,
-                       help='Experiment name (e.g., ED12)')
-    parser.add_argument('--episodes', type=int, default=5,
-                       help='Number of validation episodes to run')
-    parser.add_argument('--backfill', type=int, default=0,
-                       help='Backfill strategy (0/1)')
-    parser.add_argument('--debug', action='store_true',
-                       help='Enable debug output')
-    parser.add_argument('--sequence_length', type=int, default=1024,
-                       help='Length of job sequence to evaluate')
+    parser = argparse.ArgumentParser(description='Enhanced MARL Validation with Comprehensive Job Tracking')
+    parser.add_argument('--experiment', required=True, help='Experiment name (e.g., MARL_basic, basic) or full path')
+    parser.add_argument('--workload', required=True, help='Workload name (e.g., lublin_256_carbon_float) or file path (e.g., ./data/lublin_256_carbon_float.swf)')
+    parser.add_argument('--epoch', type=int, help='Epoch number to load weights from (if not specified, loads from final/)')
+    parser.add_argument('--episodes', type=int, default=5, help='Number of validation episodes')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
+    parser.add_argument('--backfill', type=int, default=0, help='Backfill strategy (0=FCFS, 1=backfill enabled)')
+    parser.add_argument('--debug', action='store_true', help='Enable debug output')
     
     args = parser.parse_args()
     
-    # Setup paths
-    experiment_path = f"{args.workload}/MARL_{args.experiment}"
-    workload_file = f"data/{args.workload}.swf"
-    
-    print(f"MARL Validation")
-    print(f"===============")
-    print(f"Workload: {args.workload}")
+    print("=" * 80)
+    print("ENHANCED MARL VALIDATION WITH COMPREHENSIVE JOB TRACKING")
+    print("=" * 80)
     print(f"Experiment: {args.experiment}")
+    print(f"Workload: {args.workload}")
+    print(f"Epoch: {args.epoch if args.epoch is not None else 'final'}")
     print(f"Episodes: {args.episodes}")
+    print(f"Seed: {args.seed}")
     print(f"Backfill: {args.backfill}")
-    print(f"Experiment path: {experiment_path}")
+    print(f"Debug: {args.debug}")
+    print()
     
-    # Check if experiment exists
-    if not os.path.exists(experiment_path):
-        print(f"ERROR: Experiment directory not found: {experiment_path}")
-        return 1
+    # Set seeds for reproducibility
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
     
-    # Check if workload file exists
-    if not os.path.exists(workload_file):
-        print(f"ERROR: Workload file not found: {workload_file}")
-        return 1
+    # Load model
+    print("Loading MARL model...")
+    model = load_marl_model(args.experiment, args.workload, args.epoch)
+    print("✓ Model loaded successfully")
     
-    try:
-        # Load model
-        print(f"\nLoading MARL model...")
-        model = load_marl_model(experiment_path)
-        print(f"✓ Model loaded successfully")
+    # Initialize environment
+    print("Initializing environment...")
+    
+    # Determine workload file path
+    if args.workload.endswith('.swf'):
+        # It's already a file path
+        workload_file = args.workload
+    else:
+        # It's just a workload name, construct file path
+        workload_file = f"./data/{args.workload}.swf"
+        print(f"Using workload file: {workload_file}")
+    
+    env = HPCEnv(backfill=args.backfill, debug=args.debug)
+    env.my_init(workload_file)
+    env.seed(args.seed)
+    print("✓ Environment initialized")
+    
+    # Initialize enhanced tracker
+    tracker = EnhancedJobTracker()
+    
+    # Run validation episodes
+    print(f"\nRunning {args.episodes} validation episodes...")
+    episode_results = []
+    
+    for episode in range(args.episodes):
+        print(f"\nEpisode {episode + 1}/{args.episodes}")
+        env.reset()
         
-        # Initialize environment
-        print(f"Initializing environment...")
-        env = HPCEnv(backfill=args.backfill, debug=args.debug)
-        env.my_init(workload_file=workload_file)
-        print(f"✓ Environment initialized")
+        total_reward, green_reward, jobs_completed = run_enhanced_marl_validation(
+            model, env, tracker, episode + 1
+        )
         
-        # Initialize tracker
-        tracker = JobTracker()
-        
-        # Run validation episodes
-        print(f"\nRunning {args.episodes} validation episodes...")
-        
-        # Use fixed seeds for reproducibility
-        random.seed(42)
-        np.random.seed(42)
-        start_positions = [random.randint(100, env.loads.size() - args.sequence_length - 100) 
-                          for _ in range(args.episodes)]
-        
-        total_rewards = []
-        green_rewards = []
-        
-        for episode in range(args.episodes):
-            print(f"\nEpisode {episode + 1}/{args.episodes}")
-            
-            # Reset environment for this episode
-            env.reset_for_test(args.sequence_length, start_positions[episode])
-            
-            # Run episode
-            total_reward, green_reward, jobs_completed = run_marl_validation(
-                model, env, tracker, episode + 1
-            )
-            
-            total_rewards.append(total_reward)
-            green_rewards.append(green_reward)
-        
-        # Print overall results
-        print(f"\n" + "="*50)
-        print(f"VALIDATION COMPLETE")
-        print(f"="*50)
-        print(f"Average total reward: {np.mean(total_rewards):.2f} ± {np.std(total_rewards):.2f}")
-        print(f"Average green reward: {np.mean(green_rewards):.2f} ± {np.std(green_rewards):.2f}")
-        
-        # Save results
-        save_validation_results(tracker, experiment_path, args.workload, args.episodes)
-        
-        return 0
-        
-    except Exception as e:
-        print(f"ERROR: Validation failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return 1
+        episode_results.append({
+            'episode': episode + 1,
+            'total_reward': total_reward,
+            'green_reward': green_reward,
+            'jobs_completed': jobs_completed
+        })
+    
+    # Save results
+    print(f"\nSaving enhanced validation results...")
+    # Pass the detected experiment path from model loading
+    if hasattr(model, '_experiment_path'):
+        experiment_path = model._experiment_path
+    else:
+        experiment_path = args.experiment
+    save_enhanced_validation_results(tracker, experiment_path, workload_file, args.episodes, args.epoch)
+    
+    # Print summary
+    print(f"\n" + "=" * 80)
+    print("ENHANCED VALIDATION SUMMARY")
+    print("=" * 80)
+    
+    total_rewards = [r['total_reward'] for r in episode_results]
+    green_rewards = [r['green_reward'] for r in episode_results]
+    
+    print(f"Total Reward: {np.mean(total_rewards):.2f} ± {np.std(total_rewards):.2f}")
+    print(f"Green Reward: {np.mean(green_rewards):.4f} ± {np.std(green_rewards):.4f}")
+    print(f"Episodes completed: {len(episode_results)}")
+    
+    print(f"\n✅ Enhanced validation completed successfully!")
+    if args.epoch is not None:
+        print(f"Check {args.experiment}/validation_results/epoch_{args.epoch}/ for detailed results")
+    else:
+        print(f"Check {args.experiment}/validation_results/final/ for detailed results")
 
 
 if __name__ == "__main__":
-    exit(main()) 
+    main() 
