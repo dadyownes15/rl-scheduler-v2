@@ -155,12 +155,9 @@ class Cluster:
 
         jobCarbonEmissions = carbonEmissionsAfter - carbonEmissionsBefore
 
-        # return True #EASY
-
-        if jobCarbonEmissions < 50000:  # Threshold in gCO2eq - may need adjustment
-            return True
-        else:
-            return False
+        # Carbon filtering removed - allow all jobs that can be allocated
+        # The carbon-aware ordering in backfill_score() will handle prioritization
+        return True
 
     def LPTPN_check(self,running_jobs,job,current_time):
 
@@ -196,10 +193,9 @@ class Cluster:
 
         jobCarbonEmissions = carbonEmissionsAfter - carbonEmissionsBefore
 
-        if jobCarbonEmissions < 50000:  # Threshold in gCO2eq - may need adjustment
-            return True
-        else:
-            return False
+        # Carbon filtering removed - allow all jobs that can be allocated
+        # The carbon-aware ordering in backfill_score() will handle prioritization
+        return True
 
     def backfill_check_ga(self,running_jobs,job,current_time,minGreen,backfill=1):
         if not self.can_allocated(job):
@@ -237,10 +233,9 @@ class Cluster:
 
         jobCarbonEmissions = carbonEmissionsAfter - carbonEmissionsBefore
 
-        if jobCarbonEmissions < 50000:  # Threshold in gCO2eq - may need adjustment
-            return True
-        else:
-            return False
+        # Carbon filtering removed - allow all jobs that can be allocated
+        # The carbon-aware ordering in backfill_score() will handle prioritization
+        return True
 
 
 class FakeList:

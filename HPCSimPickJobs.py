@@ -117,9 +117,46 @@ class HPCEnv(gym.Env):
         return t
 
     def backfill_score(self, job):
-        t = job.power*job.request_time*job.request_number_of_processors  # Green-Backfilling
+        # Carbon-aware backfill scoring using actual carbon emissions
+        carbon_score = self.carbon_score(job)
+        return carbon_score
 
-        return t
+    def carbon_score(self, job):
+        """
+        Calculate carbon-aware score for backfill queue ordering.
+        Lower score = higher priority (schedule first).
+        Uses getCarbonEmissions to estimate actual carbon impact.
+        """
+        # Calculate potential carbon emissions if job starts now
+        start_time = self.current_timestamp
+        end_time = start_time + job.request_time
+        power = job.power  # watts
+        
+        # Get carbon emissions for this job's time window
+        try:
+            carbon_emissions = self.cluster.carbonIntensity.getCarbonEmissions(
+                power, start_time, end_time
+            )
+        except Exception:
+            # Fallback to original scoring if carbon calculation fails
+            return job.power * job.request_time * job.request_number_of_processors
+        
+        # Incorporate job characteristics for tie-breaking and fairness
+        # - Carbon emissions (primary factor)
+        # - Job size (secondary factor - smaller jobs get slight preference)
+        # - Power efficiency (tertiary factor)
+        
+        base_carbon_score = carbon_emissions
+        
+        # Add small components for job characteristics (scaled to be secondary)
+        job_size_factor = job.request_number_of_processors * 0.01  # Small weight
+        power_factor = job.power * 0.001  # Very small weight
+        
+        # Lower score = higher priority
+        # Jobs with lower carbon emissions get scheduled first
+        total_score = base_carbon_score + job_size_factor + power_factor
+        
+        return total_score
 
     # @profile
     def reset(self):
