@@ -1,0 +1,79 @@
+================================================================================
+SCORE CALCULATION RESULTS
+================================================================================
+Generated on: 2025-06-19 14:25:35
+Score: 0.000117
+================================================================================
+
+CARBON EMISSIONS REGRESSION RESULTS:
+==================================================
+                            OLS Regression Results                            
+==============================================================================
+Dep. Variable:       carbon_emissions   R-squared:                       0.802
+Model:                            OLS   Adj. R-squared:                  0.801
+Method:                 Least Squares   F-statistic:                     7576.
+Date:                Thu, 19 Jun 2025   Prob (F-statistic):               0.00
+Time:                        14:25:35   Log-Likelihood:                -76303.
+No. Observations:                7508   AIC:                         1.526e+05
+Df Residuals:                    7503   BIC:                         1.527e+05
+Df Model:                           4                                         
+Covariance Type:            nonrobust                                         
+=================================================================================================
+                                    coef    std err          t      P>|t|      [0.025      0.975]
+-------------------------------------------------------------------------------------------------
+const                         -2118.1396    272.933     -7.761      0.000   -2653.165   -1583.115
+carbon_consideration            620.3635    269.557      2.301      0.021      91.957    1148.770
+runtime_x_processors              0.0217      0.000     93.674      0.000       0.021       0.022
+carbon_x_runtime_x_processors    -0.0064      0.000    -17.176      0.000      -0.007      -0.006
+carbon_intensity_baseline        12.9485      1.515      8.545      0.000       9.978      15.919
+==============================================================================
+Omnibus:                     7391.122   Durbin-Watson:                   1.360
+Prob(Omnibus):                  0.000   Jarque-Bera (JB):          4180254.640
+Skew:                           3.953   Prob(JB):                         0.00
+Kurtosis:                     118.326   Cond. No.                     3.97e+06
+==============================================================================
+
+Notes:
+[1] Standard Errors assume that the covariance matrix of the errors is correctly specified.
+[2] The condition number is large, 3.97e+06. This might indicate that there are
+strong multicollinearity or other numerical problems.
+
+WAIT TIME REGRESSION RESULTS:
+==================================================
+                            OLS Regression Results                            
+==============================================================================
+Dep. Variable:              wait_time   R-squared:                       0.398
+Model:                            OLS   Adj. R-squared:                  0.398
+Method:                 Least Squares   F-statistic:                     993.6
+Date:                Thu, 19 Jun 2025   Prob (F-statistic):               0.00
+Time:                        14:25:35   Log-Likelihood:            -1.1950e+05
+No. Observations:                7508   AIC:                         2.390e+05
+Df Residuals:                    7502   BIC:                         2.391e+05
+Df Model:                           5                                         
+Covariance Type:            nonrobust                                         
+=================================================================================================
+                                    coef    std err          t      P>|t|      [0.025      0.975]
+-------------------------------------------------------------------------------------------------
+const                          4.831e+06   1.09e+05     44.401      0.000    4.62e+06    5.04e+06
+carbon_consideration          -5.296e+06    8.5e+04    -62.288      0.000   -5.46e+06   -5.13e+06
+runtime_x_processors              0.7839      0.073     10.734      0.000       0.641       0.927
+carbon_x_runtime_x_processors    -0.4785      0.117     -4.096      0.000      -0.708      -0.250
+carbon_intensity_baseline      -154.8561    478.086     -0.324      0.746   -1092.039     782.327
+queue_length_at_submission     3484.0965    386.047      9.025      0.000    2727.336    4240.857
+==============================================================================
+Omnibus:                      202.606   Durbin-Watson:                   1.200
+Prob(Omnibus):                  0.000   Jarque-Bera (JB):              219.024
+Skew:                           0.407   Prob(JB):                     2.75e-48
+Kurtosis:                       3.192   Cond. No.                     4.41e+06
+==============================================================================
+
+Notes:
+[1] Standard Errors assume that the covariance matrix of the errors is correctly specified.
+[2] The condition number is large, 4.41e+06. This might indicate that there are
+strong multicollinearity or other numerical problems.
+
+KEY COEFFICIENTS COMPARISON:
+==============================
+Carbon consideration (carbon emissions): 620.363534
+Carbon consideration (wait time): -5296033.384778
+Score: 0.000117

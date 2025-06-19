@@ -10,6 +10,25 @@ import torch.nn.functional as F
 from torch.distributions import Categorical
 from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
 import scipy.signal
+import numpy as np
+import pandas as pd
+
+# Import score calculation functionality
+try:
+    from calculate_score import run_carbon_emissions_regression, run_wait_time_regression, calculate_score
+    SCORE_CALCULATION_AVAILABLE = True
+except ImportError:
+    SCORE_CALCULATION_AVAILABLE = False
+    print("Warning: Score calculation not available. calculate_score.py not found.")
+
+# Import validation functionality for score calculation
+try:
+    from validate import load_marl_model, run_enhanced_marl_validation, EnhancedJobTracker, save_enhanced_validation_results
+    VALIDATION_AVAILABLE = True
+except ImportError:
+    VALIDATION_AVAILABLE = False
+    print("Warning: Validation functionality not available for score calculation.")
+
 from HPCSimPickJobs import *
 
 class Buffer():
@@ -463,6 +482,157 @@ class PPO():
 
         return ac1, ac2
 
+class PPOModelWrapper:
+    """
+    Wrapper class to make PPO model compatible with validation system.
+    The validation system expects a model with an eval_action method.
+    """
+    def __init__(self, ppo_model):
+        self.ppo_model = ppo_model
+        
+    def eval_action(self, o, mask1, mask2):
+        """
+        Wrapper for eval_action to match validation interface
+        """
+        return self.ppo_model.eval_action(o, mask1, mask2)
+
+def calculate_epoch_score(ppo_model, env, experiment_dir, epoch, workload, debug=False):
+    """
+    Calculate score for the current epoch by running validation and score calculation.
+    
+    Args:
+        ppo_model: Trained PPO model
+        env: Environment instance
+        experiment_dir: Experiment directory path
+        epoch: Current epoch number
+        workload: Workload name
+        debug: Debug flag
+    
+    Returns:
+        float: Calculated score (or None if calculation fails)
+    """
+    if not (SCORE_CALCULATION_AVAILABLE and VALIDATION_AVAILABLE):
+        if debug:
+            print(f"  Score calculation skipped (dependencies not available)")
+        return None
+    
+    try:
+        if debug:
+            print(f"  Running validation for score calculation...")
+        
+        # Wrap the PPO model for compatibility with validation system
+        wrapped_model = PPOModelWrapper(ppo_model)
+        
+        # Initialize enhanced tracker for validation
+        tracker = EnhancedJobTracker()
+        
+        # Run a single validation episode to collect data
+        env.reset()
+        total_reward, green_reward, jobs_completed = run_enhanced_marl_validation(
+            wrapped_model, env, tracker, 1
+        )
+        
+        # Check if we have enough data for score calculation
+        if len(tracker.jobs_data) < 10 or len(tracker.carbon_window_data) < 10:
+            if debug:
+                print(f"  Insufficient data for score calculation (jobs: {len(tracker.jobs_data)}, windows: {len(tracker.carbon_window_data)})")
+            return None
+        
+        # Prepare data for score calculation
+        jobs_df = pd.DataFrame(tracker.jobs_data)
+        scheduled_jobs = jobs_df[jobs_df['scheduled'] == True]
+        
+        if len(scheduled_jobs) < 5:
+            if debug:
+                print(f"  Insufficient scheduled jobs for score calculation ({len(scheduled_jobs)})")
+            return None
+        
+        # Add carbon window data
+        window_df = pd.DataFrame(tracker.carbon_window_data)
+        if len(window_df) > 0:
+            # Merge carbon window averages with job data
+            window_summary = window_df.groupby('job_id').agg({
+                'carbon_intensity_avg': 'first',
+                'carbon_intensity_min': 'first', 
+                'carbon_intensity_max': 'first'
+            }).reset_index()
+            
+            scheduled_jobs = scheduled_jobs.merge(window_summary, on='job_id', how='left')
+            scheduled_jobs['carbon_intensity_baseline'] = scheduled_jobs['carbon_intensity_avg'].fillna(350.0)
+        else:
+            scheduled_jobs['carbon_intensity_baseline'] = 350.0  # Default baseline
+        
+        # Create interaction terms for regression
+        scheduled_jobs['runtime_x_processors'] = scheduled_jobs['request_time'] * scheduled_jobs['request_processors']
+        scheduled_jobs['carbon_x_runtime_x_processors'] = (
+            scheduled_jobs['carbon_consideration'] * 
+            scheduled_jobs['request_time'] * 
+            scheduled_jobs['request_processors']
+        )
+        
+        # Check for required columns
+        required_cols = ['carbon_consideration', 'carbon_emissions', 'wait_time', 
+                        'queue_length_at_submission', 'carbon_intensity_baseline']
+        missing_cols = [col for col in required_cols if col not in scheduled_jobs.columns]
+        if missing_cols:
+            if debug:
+                print(f"  Missing required columns for score calculation: {missing_cols}")
+            return None
+        
+        # Run regressions
+        carbon_model, _, _ = run_carbon_emissions_regression(scheduled_jobs)
+        wait_model, _, _ = run_wait_time_regression(scheduled_jobs) 
+        
+        # Calculate score
+        score = calculate_score(carbon_model, wait_model)
+        
+        # Save score to epoch-specific file
+        score_file = f"{experiment_dir}/score_epoch_{epoch}.txt"
+        with open(score_file, 'w') as f:
+            f.write(f"Epoch {epoch} Score Calculation\n")
+            f.write("="*50 + "\n")
+            f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Score: {score:.6f}\n")
+            f.write(f"Jobs analyzed: {len(scheduled_jobs)}\n")
+            f.write(f"Carbon windows captured: {len(tracker.carbon_window_data)}\n\n")
+            
+            f.write("Carbon Emissions Regression Summary:\n")
+            f.write(f"R-squared: {carbon_model.rsquared:.4f}\n")
+            f.write(f"Carbon consideration coef: {carbon_model.params['carbon_consideration']:.6f}\n\n")
+            
+            f.write("Wait Time Regression Summary:\n")
+            f.write(f"R-squared: {wait_model.rsquared:.4f}\n")
+            f.write(f"Carbon consideration coef: {wait_model.params['carbon_consideration']:.6f}\n")
+        
+        # Also append to main scores CSV
+        scores_csv = f"{experiment_dir}/epoch_scores.csv"
+        file_exists = os.path.exists(scores_csv)
+        
+        with open(scores_csv, 'a', newline='') as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(['epoch', 'score', 'carbon_r2', 'wait_r2', 'carbon_coef', 'wait_coef', 'jobs_analyzed'])
+            
+            writer.writerow([
+                epoch,
+                score,
+                carbon_model.rsquared,
+                wait_model.rsquared,
+                carbon_model.params['carbon_consideration'],
+                wait_model.params['carbon_consideration'],
+                len(scheduled_jobs)
+            ])
+        
+        if debug:
+            print(f"  Score calculated: {score:.4f} (saved to score_epoch_{epoch}.txt)")
+        
+        return score
+        
+    except Exception as e:
+        if debug:
+            print(f"  Score calculation failed: {str(e)}")
+        return None
+
 def setup_experiment_directory(workload, experiment_name, description):
     """
     Setup the experiment directory structure:
@@ -528,13 +698,27 @@ def train(workload, backfill, debug=False, experiment_name="", description=""):
     experiment_dir = setup_experiment_directory(workload, experiment_name, description)
     print(f"Experiment directory: {experiment_dir}")
     
-    if debug:
-        print(f"DEBUG: Training parameters:")
-        print(f"  Workload: {workload}")
-        print(f"  Backfill: {backfill}")
-        print(f"  Epochs: {epochs}")
-        print(f"  Trajectories per epoch: {traj_num}")
-        print(f"  Seed: {seed}")
+    # Always print training parameters (not just in debug mode)
+    print(f"Training parameters:")
+    print(f"  Workload: {workload}")
+    print(f"  Backfill: {backfill}")
+    print(f"  Epochs: {epochs}")
+    print(f"  Trajectories per epoch: {traj_num}")
+    print(f"  Seed: {seed}")
+    print(f"  Eta: {float(config.get('GAS-MARL setting', 'eta', fallback=0.5))}")
+    
+    # Print other important configuration variables
+    print(f"Configuration:")
+    print(f"  Max queue size: {config.get('GAS-MARL setting', 'max_queue_size')}")
+    print(f"  Run window: {config.get('GAS-MARL setting', 'run_win')}")
+    print(f"  Green window: {config.get('GAS-MARL setting', 'green_win')}")
+    print(f"  Delay max jobs: {config.get('GAS-MARL setting', 'delaymaxjobnum')}")
+    print(f"  Use constant power: {config.get('power setting', 'use_constant_power')}")
+    if config.getboolean('power setting', 'use_constant_power', fallback=False):
+        print(f"  Constant power per processor: {config.get('power setting', 'constant_power_per_processor')}")
+    print(f"  Use dynamic carbon window: {config.get('carbon setting', 'use_dynamic_window')}")
+    print(f"  Reward function: {config.get('reward_config', 'reward_function', fallback='legacy')}")
+    print(f"  Carbon year: {config.get('general setting', 'carbon_year')}")
     
     env = HPCEnv(backfill=backfill, debug=debug)  # custom cluster-scheduling env
     env.seed(seed)                  # reproducible RNG for env
@@ -575,6 +759,11 @@ def train(workload, backfill, debug=False, experiment_name="", description=""):
     # ------------------------------------------------------------------
     # 3. PPO agent creation
     # ------------------------------------------------------------------
+    # Read eta from config
+    eta = float(config.get('GAS-MARL setting', 'eta', fallback=0.5))
+    if debug:
+        print(f"  Using eta: {eta}")
+        
     inputNum_size    = [MAX_QUEUE_SIZE, run_win, green_win]       # grid dims
     featureNum_size  = [JOB_FEATURES,   RUN_FEATURE, GREEN_FEATURE]
     
@@ -604,9 +793,9 @@ def train(workload, backfill, debug=False, experiment_name="", description=""):
         # --------------------------------------------------------------
         # 5. Collect trajectories until we hit traj_num
         # --------------------------------------------------------------
+        trajectory_stats = {"valid_jobs": [], "actions": [], "rewards": []}
+        
         while True:
-            if debug and t < 3:  # Only debug first few trajectories
-                print(f"  DEBUG: Trajectory {t + 1}, step {ep_len}, running jobs: {running_num}")
             # ----------------------------------------------------------
             # 5-a. Build action masks
             #      mask1 → which queue entries are *valid* jobs
@@ -631,22 +820,9 @@ def train(workload, backfill, debug=False, experiment_name="", description=""):
                 else:
                     lst.append(0)  # Valid job
             
-            # Debug mask creation
-            if debug and t < 3 and ep_len < 5:
-                valid_jobs = lst.count(0)
-                print(f"    MASK DEBUG: Valid jobs found: {valid_jobs}/{MAX_QUEUE_SIZE}")
-                print(f"    MASK DEBUG: First 10 mask values: {lst[:10]}")
-                print(f"    MASK DEBUG: Job queue size from env: {len(env.job_queue)}")
-                # Check the expected padding pattern for 7 features
-                expected_padding = [0, 1, 1, 1, 1, 0.5, 0]
-                print(f"    MASK DEBUG: Expected padding pattern (7 features): {expected_padding}")
-                # Check a few job slices
-                for idx in range(min(3, MAX_QUEUE_SIZE)):
-                    start = idx * JOB_FEATURES
-                    end = start + JOB_FEATURES
-                    slice_data = o[start:end]
-                    mask_val = lst[idx]
-                    print(f"    MASK DEBUG: Job {idx}: mask={mask_val}, features={slice_data}")
+            # Collect stats for aggregated debugging
+            valid_jobs = lst.count(0)
+            trajectory_stats["valid_jobs"].append(valid_jobs)
             
             mask2 = np.zeros(action2_num, dtype=int)
             if running_num < delayMaxJobNum:                 # cannot delay past running capacity
@@ -670,17 +846,17 @@ def train(workload, backfill, debug=False, experiment_name="", description=""):
                 action2, greenRwd, mask1T, mask2T, device, job_input
             )
             
+            # Collect action stats
+            trajectory_stats["actions"].append((action1.item(), action2.item()))
+            
             # ----------------------------------------------------------
             # 5-c. Step the environment
             # ----------------------------------------------------------
-            if debug and t < 3 and ep_len < 5:  # Only debug first few steps of first trajectories
-                print(f"    Action1: {action1.item()}, Action2: {action2.item()}")
-                
             o, r, d, r2, sjf_t, f1_t, running_num, greenRwd = \
                 env.step(action1.item(), action2.item())
                 
-            if debug and t < 3 and ep_len < 5:
-                print(f"    Reward: {r:.4f}, Green reward: {greenRwd:.4f}, Done: {d}")
+            # Collect reward stats
+            trajectory_stats["rewards"].append((r, greenRwd))
             
             # Trajectory-level bookkeeping
             ep_ret   += r
@@ -698,8 +874,11 @@ def train(workload, backfill, debug=False, experiment_name="", description=""):
             # 5-d. If episode ends → push terminal reward, maybe finish epoch
             # ----------------------------------------------------------
             if d:
+                # Print aggregated trajectory summary for debugging
                 if debug and t < 3:
-                    print(f"  DEBUG: Episode {t + 1} completed, episode return: {ep_ret:.4f}, steps: {ep_len}")
+                    avg_valid_jobs = sum(trajectory_stats["valid_jobs"]) / len(trajectory_stats["valid_jobs"]) if trajectory_stats["valid_jobs"] else 0
+                    total_rewards = sum([r[0] + r[1] for r in trajectory_stats["rewards"]])
+                    print(f"  Episode {t + 1}: {ep_len} steps, {ep_ret:.4f} return, avg {avg_valid_jobs:.1f} valid jobs, total reward: {total_rewards:.4f}")
                     
                 t += 1                                     # finished a trajectory
                 ppo.storeIntoBuffter(eta * r + greenRwd)   # final R for GAE
@@ -711,21 +890,21 @@ def train(workload, backfill, debug=False, experiment_name="", description=""):
                 )
                 running_num = 0
                 
+                # Reset trajectory stats for next episode
+                trajectory_stats = {"valid_jobs": [], "actions": [], "rewards": []}
+                
                 if t >= traj_num:     # collected enough rollouts for this epoch
                     if debug:
-                        print(f"  DEBUG: Epoch {epoch + 1} data collection complete ({t} trajectories)")
+                        print(f"  Epoch {epoch + 1} data collection complete ({t} trajectories)")
                     break
         
         # --------------------------------------------------------------
         # 6. Policy / value-function update after traj_num rollouts
         # --------------------------------------------------------------
         if debug:
-            print(f"  DEBUG: Starting policy update for epoch {epoch + 1}")
+            print(f"  Training policy for epoch {epoch + 1}...")
             
         ppo.train()
-        
-        if debug:
-            print(f"  DEBUG: Policy update complete")
         
         # --------------------------------------------------------------
         # 7. Logging: append averaged rewards to CSV
@@ -751,20 +930,24 @@ def train(workload, backfill, debug=False, experiment_name="", description=""):
                 avg_wait_reward
             ])
         
-        if debug:
-            print(f"  DEBUG: Epoch {epoch + 1} summary:")
-            print(f"    Total reward: {avg_epoch_reward:.4f}")
-            print(f"    Green reward: {avg_green_reward:.4f}")
-            print(f"    Wait reward: {avg_wait_reward:.4f}")
-        elif (epoch + 1) % 10 == 0:  # Print every 10 epochs when not in debug mode
-            print(f"Epoch {epoch + 1}/{epochs} - Total: {avg_epoch_reward:.4f}, Green: {avg_green_reward:.4f}, Wait: {avg_wait_reward:.4f}")
+        # Always show epoch summary (every epoch)
+        print(f"Epoch {epoch + 1:3d}/{epochs} | Total: {avg_epoch_reward:7.3f} | Green: {avg_green_reward:7.3f} | Wait: {avg_wait_reward:7.3f}")
         
         # Save model weights every 5 epochs
         if (epoch + 1) % 5 == 0:
             checkpoint_path = f"{experiment_dir}/checkpoints/epoch_{epoch + 1}/"
             ppo.save_using_model_name(checkpoint_path)
-            if debug or (epoch + 1) % 10 == 0:
-                print(f"  Saved checkpoint at epoch {epoch + 1}: {checkpoint_path}")
+            if debug:
+                print(f"  → Checkpoint saved: epoch_{epoch + 1}/")
+            
+            # Calculate score every 5th epoch
+            if debug:
+                print(f"  → Calculating score for epoch {epoch + 1}...")
+            score = calculate_epoch_score(ppo, env, experiment_dir, epoch + 1, workload, debug)
+            if score is not None:
+                print(f"Epoch {epoch + 1:3d} Score: {score:7.4f}")
+            else:
+                print(f"Epoch {epoch + 1:3d} Score: calculation skipped")
         
         # clear buffers so next epoch starts fresh
         ppo.buffer.clear_buffer()
@@ -780,6 +963,9 @@ def train(workload, backfill, debug=False, experiment_name="", description=""):
     legacy_path = f"{workload}/MARL/"
     ppo.save_using_model_name(legacy_path)
     print(f"Legacy model saved to: {legacy_path}")
+    
+    print(f"Training completed!")
+    return experiment_dir
 
 
 

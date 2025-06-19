@@ -1,0 +1,4 @@
+Experiment: MARL_carbon_smaller_delay_windows
+Workload: lublin_256_carbon_float
+Timestamp: 2025-06-19 12:12:41
+Description: Test if smaller delay time list helps to improve the carbon reward convergence

@@ -1,0 +1,4 @@
+Experiment: MARL_eta_and_longer_delays_and_Easy_backfill
+Workload: lublin_256_carbon_float
+Timestamp: 2025-06-19 14:54:54
+Description: We want to maximize some tradeoff between eta and carbon emissions, so we will include longer delays + eta, which potentially will be a catastrophe, but i am hopping not. we include backfill, to minimize the punishments of long delay, and we will make eta very little

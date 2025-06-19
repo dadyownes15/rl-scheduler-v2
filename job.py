@@ -2,6 +2,7 @@ import re
 import sys
 import os
 import csv
+import configparser
 
 
 class Job:
@@ -127,9 +128,24 @@ class Workloads:
         self.max_power = 0
         self.min_submitTime = -sys.maxsize - 1
 
+        # Load configuration for power settings
         current_dir = os.getcwd()
-        power_file = os.path.join(current_dir, "./data/power.csv")
-        self.powerList = self.read_csv_to_list(power_file)
+        config_file = os.path.join(current_dir, "./configFile/config.ini")
+        config = configparser.ConfigParser()
+        config.read(config_file)
+        
+        # Check if we should use constant power or CSV file
+        use_constant_power = config.getboolean('power setting', 'use_constant_power', fallback=False)
+        constant_power_per_processor = config.getfloat('power setting', 'constant_power_per_processor', fallback=500.0)
+        
+        # Load power data from CSV only if not using constant power
+        if not use_constant_power:
+            power_file = os.path.join(current_dir, "./data/power.csv")
+            self.powerList = self.read_csv_to_list(power_file)
+            print("Using power values from CSV file")
+        else:
+            self.powerList = None
+            print(f"Using constant power: {constant_power_per_processor} watts per processor")
 
         powerIndex = 0
         with open(path) as fp:
@@ -144,7 +160,12 @@ class Workloads:
                     continue
 
                 j = Job(line)
-                j.power = float(self.powerList[powerIndex]) * j.request_number_of_processors
+                
+                # Set power based on configuration
+                if use_constant_power:
+                    j.power = constant_power_per_processor * j.request_number_of_processors
+                else:
+                    j.power = float(self.powerList[powerIndex]) * j.request_number_of_processors
 
                 powerIndex += 1
                 if self.min_submitTime == -sys.maxsize - 1:

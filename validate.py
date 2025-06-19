@@ -117,8 +117,9 @@ class EnhancedJobTracker:
         self.jobs_data = []
         self.episode_data = []
         self.job_id_to_index = {}  # Map job_id to index for faster lookup
+        self.carbon_window_data = []  # Store viewable window data for each job
         
-    def record_job_submission(self, job, queue_length, current_time):
+    def record_job_submission(self, job, queue_length, current_time, env=None):
         """Record job when it's submitted to the queue"""
         job_info = {
             'job_id': getattr(job, 'job_id', 'unknown'),
@@ -145,7 +146,97 @@ class EnhancedJobTracker:
         job_index = len(self.jobs_data)
         self.jobs_data.append(job_info)
         self.job_id_to_index[job.job_id] = job_index
+        
         return job_index
+    
+    def record_agent_decision(self, env, selected_job, action1, action2):
+        """
+        Record the exact carbon window the agent saw when making this scheduling decision
+        
+        Args:
+            env: Environment with carbon intensity data
+            selected_job: Job that was selected for scheduling (or None)
+            action1: Action 1 (job selection)
+            action2: Action 2 (delay)
+        """
+        if selected_job is None:
+            return
+            
+        try:
+            # Get the EXACT carbon window that the agent saw when making this decision
+            # This is the same call made in build_observation()
+            carbon_slots = env.cluster.carbonIntensity.getCarbonIntensitySlot(env.current_timestamp)
+            
+            # Extract the raw intensities and times exactly as the agent sees them
+            intensities = [slot['carbonIntensity'] for slot in carbon_slots]
+            last_times = [slot['lastTime'] for slot in carbon_slots]
+            
+            # Calculate window statistics
+            window_data = {
+                'job_id': selected_job.job_id,
+                'decision_timestamp': env.current_timestamp,
+                'action1': action1.item() if hasattr(action1, 'item') else int(action1),
+                'action2': action2.item() if hasattr(action2, 'item') else int(action2),
+                # Raw carbon window data (exactly what agent sees)
+                'carbon_intensities': intensities,
+                'last_times': last_times,
+                'window_start_time': env.current_timestamp,
+                'window_duration_hours': len(intensities),
+                # Statistical summaries
+                'carbon_intensity_min': min(intensities) if intensities else 0,
+                'carbon_intensity_max': max(intensities) if intensities else 0,
+                'carbon_intensity_avg': sum(intensities) / len(intensities) if intensities else 0,
+                'carbon_intensity_std': np.std(intensities) if intensities else 0,
+                # Job characteristics
+                'job_power': getattr(selected_job, 'power', 0),
+                'job_runtime': selected_job.request_time,
+                'job_processors': selected_job.request_number_of_processors,
+                'job_carbon_consideration': getattr(selected_job, 'carbon_consideration', -1),
+                # Queue state
+                'queue_length_at_decision': len(env.job_queue),
+                'running_jobs_count': len(env.running_jobs)
+            }
+            
+            # Calculate immediate vs worst-case emissions using the same window
+            if hasattr(env.cluster.carbonIntensity, 'getCarbonEmissions'):
+                # Emissions if scheduled immediately
+                immediate_emissions = env.cluster.carbonIntensity.getCarbonEmissions(
+                    selected_job.power, env.current_timestamp, 
+                    env.current_timestamp + selected_job.request_time
+                )
+                window_data['emissions_if_immediate'] = immediate_emissions
+                
+                # Worst-case emissions within this viewable window
+                try:
+                    window_end = env.current_timestamp + (len(intensities) * 3600)
+                    worst_case_intensity = env.cluster.carbonIntensity.getMaxCarbonIntensityInPeriod(
+                        env.current_timestamp, window_end, selected_job.request_time
+                    )
+                    energy_kwh = (selected_job.power / 1000.0) * (selected_job.request_time / 3600.0)
+                    worst_case_emissions = energy_kwh * worst_case_intensity
+                    window_data['worst_case_emissions'] = worst_case_emissions
+                    window_data['worst_case_intensity'] = worst_case_intensity
+                except Exception as e:
+                    window_data['worst_case_emissions'] = None
+                    window_data['worst_case_intensity'] = None
+                    window_data['worst_case_error'] = str(e)
+            
+            self.carbon_window_data.append(window_data)
+            
+        except Exception as e:
+            # Record minimal data if error occurs
+            error_data = {
+                'job_id': selected_job.job_id if selected_job else 'unknown',
+                'decision_timestamp': env.current_timestamp,
+                'action1': action1.item() if hasattr(action1, 'item') else int(action1),
+                'action2': action2.item() if hasattr(action2, 'item') else int(action2),
+                'error': str(e),
+                'carbon_intensities': [],
+                'last_times': [],
+                'window_start_time': env.current_timestamp,
+                'window_duration_hours': 0
+            }
+            self.carbon_window_data.append(error_data)
     
     def update_job_scheduling(self, job_index, job, scheduled_time, action1, action2):
         """Update job info when it gets scheduled with enhanced carbon calculation"""
@@ -273,7 +364,7 @@ def run_enhanced_marl_validation(model, env, tracker, episode_num):
         for job in env.job_queue:
             if job not in job_indices:
                 job_idx = tracker.record_job_submission(
-                    job, len(env.job_queue), env.current_timestamp
+                    job, len(env.job_queue), env.current_timestamp, env
                 )
                 job_indices[job] = job_idx
         
@@ -306,6 +397,10 @@ def run_enhanced_marl_validation(model, env, tracker, episode_num):
         selected_job = None
         if a1 < len(env.job_queue):
             selected_job = env.job_queue[a1]
+        
+        # CRITICAL: Record the exact carbon window the agent saw when making this decision
+        # This must be done BEFORE env.step() because the timestamp may change after
+        tracker.record_agent_decision(env, selected_job, a1, a2)
         
         # Step environment
         o, r, d, r2, sjf_t, f1_t, running_num, greenRwd = env.step(a1, a2)
@@ -416,6 +511,61 @@ def save_enhanced_validation_results(tracker, experiment_path, workload, episode
         episodes_df = pd.DataFrame(tracker.episode_data)
         episodes_df.to_csv(episodes_file, index=False)
         print(f"Enhanced episode summary saved to: {episodes_file}")
+    
+    # Save carbon window data
+    carbon_window_file = f"{results_dir}/carbon_window_data.csv"
+    if tracker.carbon_window_data:
+        # Flatten the carbon window data for CSV storage
+        flattened_window_data = []
+        for window in tracker.carbon_window_data:
+            base_data = {
+                'job_id': window.get('job_id', 'unknown'),
+                'decision_timestamp': window.get('decision_timestamp', 0),
+                'action1': window.get('action1', -1),
+                'action2': window.get('action2', -1),
+                'window_start_time': window.get('window_start_time', 0),
+                'window_duration_hours': window.get('window_duration_hours', 0),
+                'carbon_intensity_min': window.get('carbon_intensity_min', 0),
+                'carbon_intensity_max': window.get('carbon_intensity_max', 0),
+                'carbon_intensity_avg': window.get('carbon_intensity_avg', 0),
+                'carbon_intensity_std': window.get('carbon_intensity_std', 0),
+                'job_power': window.get('job_power', 0),
+                'job_runtime': window.get('job_runtime', 0),
+                'job_processors': window.get('job_processors', 0),
+                'job_carbon_consideration': window.get('job_carbon_consideration', -1),
+                'queue_length_at_decision': window.get('queue_length_at_decision', 0),
+                'running_jobs_count': window.get('running_jobs_count', 0),
+                'emissions_if_immediate': window.get('emissions_if_immediate', None),
+                'worst_case_emissions': window.get('worst_case_emissions', None),
+                'worst_case_intensity': window.get('worst_case_intensity', None),
+                'error': window.get('error', None)
+            }
+            
+            # Add individual carbon intensities as separate columns
+            intensities = window.get('carbon_intensities', [])
+            for i, intensity in enumerate(intensities):
+                base_data[f'carbon_intensity_hour_{i}'] = intensity
+            
+            # Add last times as separate columns
+            last_times = window.get('last_times', [])
+            for i, last_time in enumerate(last_times):
+                base_data[f'last_time_hour_{i}'] = last_time
+            
+            flattened_window_data.append(base_data)
+        
+        window_df = pd.DataFrame(flattened_window_data)
+        window_df.to_csv(carbon_window_file, index=False)
+        print(f"Carbon window data saved to: {carbon_window_file}")
+        
+        # Print window data statistics
+        if len(flattened_window_data) > 0:
+            print(f"\nCarbon Window Statistics:")
+            print(f"  Windows captured: {len(flattened_window_data)}")
+            print(f"  Average window duration: {window_df['window_duration_hours'].mean():.1f} hours")
+            print(f"  Carbon intensity range:")
+            print(f"    Min across all windows: {window_df['carbon_intensity_min'].min():.2f} gCO2eq/kWh")
+            print(f"    Max across all windows: {window_df['carbon_intensity_max'].max():.2f} gCO2eq/kWh")
+            print(f"    Average intensity: {window_df['carbon_intensity_avg'].mean():.2f} gCO2eq/kWh")
 
 
 def main():
