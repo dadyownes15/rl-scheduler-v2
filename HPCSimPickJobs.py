@@ -26,14 +26,15 @@ idlePower = float(config.get('general setting', 'idlePower'))
 MAX_perProcPower = float(config.get('general setting', 'MAX_perProcPower'))
 carbon_year = int(config.get('general setting', 'carbon_year'))
 
-MAX_POWER = 19000
-MAX_GREEN = 19000
-MAX_WAIT_TIME = 12 * 60 * 60
-MAX_RUN_TIME = 12 * 60 * 60
-JOB_FEATURES = 7
-JOB_SEQUENCE_SIZE = MAX_QUEUE_SIZE
-RUN_FEATURE = 4
-GREEN_FEATURE = 2
+# Algorithm constants
+MAX_POWER = int(config.get('algorithm constants', 'MAX_POWER'))
+MAX_GREEN = int(config.get('algorithm constants', 'MAX_GREEN'))
+MAX_WAIT_TIME = int(config.get('algorithm constants', 'MAX_WAIT_TIME'))
+MAX_RUN_TIME = int(config.get('algorithm constants', 'MAX_RUN_TIME'))
+JOB_FEATURES = int(config.get('algorithm constants', 'JOB_FEATURES'))
+JOB_SEQUENCE_SIZE = int(config.get('algorithm constants', 'JOB_SEQUENCE_SIZE'))
+RUN_FEATURE = int(config.get('algorithm constants', 'RUN_FEATURE'))
+GREEN_FEATURE = int(config.get('algorithm constants', 'GREEN_FEATURE'))
 
 
 action2_num= len(delayTimeList) + delayMaxJobNum + 1
@@ -78,12 +79,21 @@ class HPCEnv(gym.Env):
 
         self.backfill = backfill
 
+        # Episode-specific carbon-timeline offset (in hours)
+        self.episode_start_hour_offset = 0
+
 
     # @profile
     def my_init(self, workload_file='', sched_file=''):
         print("loading workloads from dataset:", workload_file)
         self.loads = Workloads(workload_file)
         self.cluster = Cluster("Cluster", self.loads.max_nodes, self.loads.max_procs / self.loads.max_nodes, processor_per_machine, idlePower, green_win, year=carbon_year)
+        
+        # Verification: Check that environment is properly initialized with carbon-aware components
+        if self.debug:
+            assert hasattr(self.cluster, 'PowerStruc'), "Cluster should have PowerStruc"
+            assert hasattr(self.cluster, 'carbonIntensity'), "Cluster should have carbonIntensity"
+            assert type(self.cluster.PowerStruc).__name__ == 'power_struc_carbon', f"PowerStruc should be power_struc_carbon, got {type(self.cluster.PowerStruc).__name__}"
 
     def seed(self, seed=None):
         self.np_random, seed = seeding.np_random(seed)
@@ -116,6 +126,15 @@ class HPCEnv(gym.Env):
         self.cluster.reset()
         self.loads.reset()
 
+        # ---------- choose a fresh carbon-intensity start hour ----------
+        max_hours = len(self.cluster.carbonIntensity.carbonIntensityList)
+        if hasattr(self.np_random, 'integers'):
+            self.episode_start_hour_offset = int(self.np_random.integers(0, max_hours))
+        else:
+            self.episode_start_hour_offset = int(self.np_random.randint(0, max_hours))
+        self.cluster.carbonIntensity.setStartOffset(self.episode_start_hour_offset)
+        # ---------------------------------------------------------------
+
         self.job_queue = []
         self.running_jobs = []
         self.visible_jobs = []
@@ -143,11 +162,21 @@ class HPCEnv(gym.Env):
         self.job_queue.append(self.loads[self.start])
         self.next_arriving_job_idx = self.start + 1
 
+        # Verification: Check that reset was successful and power tracking is ready
+        # Verify first job has carbon consideration
+        if self.debug:
+            first_job = self.loads[self.start]
+            assert hasattr(first_job, 'carbon_consideration'), f"Job {first_job.job_id} should have carbon_consideration attribute"
+        
         return self.build_observation()
 
     def reset_for_test(self, num, start):
         self.cluster.reset()
         self.loads.reset()
+
+        # Keep deterministic (or set as you prefer)
+        self.episode_start_hour_offset = 0
+        self.cluster.carbonIntensity.setStartOffset(self.episode_start_hour_offset)
 
         self.job_queue = []
         self.running_jobs = []
@@ -265,7 +294,7 @@ class HPCEnv(gym.Env):
                         _j.allocated_machines = self.cluster.allocate(_j.job_id, _j.request_number_of_processors)
                         self.cluster.PowerStruc.update(_j.scheduled_time,
                                                        _j.scheduled_time + _j.run_time,
-                                                       _j.power)
+                                                       _j.power, _j.job_id)
                         self.running_jobs.append(_j)
                         score = self.job_score(_j)  # calculated reward
                         scheduled_logs[_j.job_id] = score
@@ -320,7 +349,14 @@ class HPCEnv(gym.Env):
                                                                           job_for_scheduling.request_number_of_processors)
             self.cluster.PowerStruc.update(job_for_scheduling.scheduled_time,
                                            job_for_scheduling.scheduled_time + job_for_scheduling.run_time,
-                                           job_for_scheduling.power)
+                                           job_for_scheduling.power, job_for_scheduling.job_id)
+            
+            # Verification: Check that job power consumption was recorded
+            if self.debug:
+                job_power_data = self.cluster.PowerStruc.getJobPowerConsumption(job_for_scheduling.job_id)
+                assert len(job_power_data) > 0, f"Job {job_for_scheduling.job_id} power consumption should be recorded"
+                assert job_for_scheduling.job_id in self.cluster.PowerStruc.jobPowerLogs, f"Job {job_for_scheduling.job_id} should be in jobPowerLogs"
+            
             self.running_jobs.append(job_for_scheduling)
             score = self.job_score(job_for_scheduling)  # calculated reward
             scheduled_logs[job_for_scheduling.job_id] = score
@@ -337,8 +373,8 @@ class HPCEnv(gym.Env):
             if hasattr(job, 'scheduled_time') and job.scheduled_time != -1:
                 scheduledJobs.append(job)
         
-        carbonRwd = self.cluster.carbonIntensity.getCarbonAwareReward(
-            self.cluster.PowerStruc.powerSlotLog, scheduledJobs)
+        # Use simplified post-scheduling carbon reward calculation
+        carbonRwd = self.cluster.carbonIntensity.getCarbonAwareReward(scheduledJobs)
 
         self.cluster.reset()
         self.loads.reset()
@@ -358,7 +394,6 @@ class HPCEnv(gym.Env):
         self.job_queue.sort(key=lambda job: self.fcfs_score(job))
 
         self.running_jobs.sort(key=lambda running_job: (running_job.scheduled_time + running_job.request_time))
-        currentSlot=self.cluster.PowerStruc.getSlotFromRunning(self.running_jobs,self.current_timestamp)
         self.pairs = [
                          [
                              job,
@@ -368,7 +403,7 @@ class HPCEnv(gym.Env):
                              min(float(job.power) / float(MAX_POWER), 1.0 - 1e-5),
                              min(float(job.power / job.request_number_of_processors) / float(MAX_perProcPower),
                                  1.0 - 1e-5),
-                             float(job.carbon_consideration) / 4.0,  # Normalize 0-4 to 0-1
+                             float(job.carbon_consideration),  # Already normalized 0-1
                              1.0 - 1e-5 if self.cluster.can_allocated(job) else 1e-5
                          ]
                          for i, job in enumerate(self.job_queue)
@@ -389,7 +424,7 @@ class HPCEnv(gym.Env):
                                   MAX_perProcPower), 1.0 - 1e-5),
                               min(float(temp_job.scheduled_time + temp_job.request_time - self.current_timestamp) / float(
                                   self.loads.max_exec_time), 1.0 - 1e-5),
-                              float(temp_job.carbon_consideration) / 4.0,  # Carbon consideration
+                              float(temp_job.carbon_consideration),  # Carbon consideration (0-1)
                               0, 0  # Padding to make it 7 features
                           ]
                           for i, temp_job in enumerate(self.running_jobs[:run_win])
@@ -453,7 +488,7 @@ class HPCEnv(gym.Env):
                     _j.allocated_machines = self.cluster.allocate(_j.job_id, _j.request_number_of_processors)
                     self.cluster.PowerStruc.update(_j.scheduled_time,
                                                    _j.scheduled_time + _j.run_time,
-                                                   _j.power)
+                                                   _j.power, _j.job_id)
                     self.running_jobs.append(_j)
                     score = self.job_score(_j)  # calculated reward
                     self.scheduled_rl[_j.job_id] = score
@@ -563,7 +598,7 @@ class HPCEnv(gym.Env):
                                                                       job_for_scheduling.request_number_of_processors)
         self.cluster.PowerStruc.update(job_for_scheduling.scheduled_time,
                                        job_for_scheduling.scheduled_time + job_for_scheduling.run_time,
-                                       job_for_scheduling.power)
+                                       job_for_scheduling.power, job_for_scheduling.job_id)
         self.running_jobs.append(job_for_scheduling)
         score = self.job_score(job_for_scheduling)  # calculated reward
         self.scheduled_rl[job_for_scheduling.job_id] = score
@@ -702,7 +737,7 @@ class HPCEnv(gym.Env):
                     _j.allocated_machines = self.cluster.allocate(_j.job_id, _j.request_number_of_processors)
                     self.cluster.PowerStruc.update(_j.scheduled_time,
                                                    _j.scheduled_time + _j.run_time,
-                                                   _j.power)
+                                                   _j.power, _j.job_id)
                     self.running_jobs.append(_j)
                     score = self.job_score(_j)  # calculated reward
                     self.scheduled_rl[_j.job_id] = score
@@ -758,7 +793,7 @@ class HPCEnv(gym.Env):
                     _j.allocated_machines = self.cluster.allocate(_j.job_id, _j.request_number_of_processors)
                     self.cluster.PowerStruc.update(_j.scheduled_time,
                                                    _j.scheduled_time + _j.run_time,
-                                                   _j.power)
+                                                   _j.power, _j.job_id)
                     self.running_jobs.append(_j)
                     score = self.job_score(_j)  # calculated reward
                     self.scheduled_rl[_j.job_id] = score
@@ -814,7 +849,7 @@ class HPCEnv(gym.Env):
                                                                       job_for_scheduling.request_number_of_processors)
         self.cluster.PowerStruc.update(job_for_scheduling.scheduled_time,
                                        job_for_scheduling.scheduled_time + job_for_scheduling.run_time,
-                                       job_for_scheduling.power)
+                                       job_for_scheduling.power, job_for_scheduling.job_id)
         self.running_jobs.append(job_for_scheduling)
         score = self.job_score(job_for_scheduling)  # calculated reward
         self.scheduled_rl[job_for_scheduling.job_id] = score
@@ -846,7 +881,7 @@ class HPCEnv(gym.Env):
                                                                       job_for_scheduling.request_number_of_processors)
         self.cluster.PowerStruc.update(job_for_scheduling.scheduled_time,
                                        job_for_scheduling.scheduled_time + job_for_scheduling.run_time,
-                                       job_for_scheduling.power)
+                                       job_for_scheduling.power, job_for_scheduling.job_id)
         self.running_jobs.append(job_for_scheduling)
         score = self.job_score(job_for_scheduling)  # calculated reward
         self.scheduled_rl[job_for_scheduling.job_id] = score
@@ -879,7 +914,7 @@ class HPCEnv(gym.Env):
                                                                                   job_for_scheduling.request_number_of_processors)
                     self.cluster.PowerStruc.update(job_for_scheduling.scheduled_time,
                                                    job_for_scheduling.scheduled_time + job_for_scheduling.run_time,
-                                                   job_for_scheduling.power)
+                                                   job_for_scheduling.power, job_for_scheduling.job_id)
                     self.running_jobs.append(job_for_scheduling)
                     score = self.job_score(job_for_scheduling)  # calculated reward
                     scheduled_logs[job_for_scheduling.job_id] = score
@@ -898,7 +933,7 @@ class HPCEnv(gym.Env):
                                                                                   job_for_scheduling.request_number_of_processors)
                     self.cluster.PowerStruc.update(job_for_scheduling.scheduled_time,
                                                    job_for_scheduling.scheduled_time + job_for_scheduling.run_time,
-                                                   job_for_scheduling.power)
+                                                   job_for_scheduling.power, job_for_scheduling.job_id)
                     self.running_jobs.append(job_for_scheduling)
                     score = self.job_score(job_for_scheduling)  # calculated reward
                     scheduled_logs[job_for_scheduling.job_id] = score
@@ -917,8 +952,8 @@ class HPCEnv(gym.Env):
             if hasattr(job, 'scheduled_time') and job.scheduled_time != -1:
                 scheduledJobs.append(job)
         
-        carbonRwd = self.cluster.carbonIntensity.getCarbonAwareReward(
-            self.cluster.PowerStruc.powerSlotLog, scheduledJobs)
+        # Use simplified post-scheduling carbon reward calculation
+        carbonRwd = self.cluster.carbonIntensity.getCarbonAwareReward(scheduledJobs)
 
         self.cluster.reset()
         self.loads.reset()
@@ -935,20 +970,12 @@ class HPCEnv(gym.Env):
 
     def step(self, a1, a2):
         # Check if a1 is valid and points to an actual job (not padding)
-        if self.debug:
-            print(f"      STEP DEBUG: a1={a1}, a2={a2}, pairs_len={len(self.pairs)}")
-            print(f"      STEP DEBUG: job_queue_size={len(self.job_queue)}")
-            
         if a1 >= len(self.pairs) or self.pairs[a1][0] is None:
-            if self.debug:
-                print(f"      STEP DEBUG: Invalid action - a1={a1} out of bounds or job is None")
             # Invalid action - return neutral state
             obs = self.build_observation()
             return [obs, 0, False, 0, 0, 0, len(self.running_jobs), 0]
         
         job_for_scheduling = self.pairs[a1][0]
-        if self.debug:
-            print(f"      STEP DEBUG: Selected job {job_for_scheduling.job_id}, carbon_consideration={job_for_scheduling.carbon_consideration}")
         if self.backfill==1:
             done=self.schedule_backfill(job_for_scheduling,a2)
         if self.backfill==2:
@@ -973,8 +1000,20 @@ class HPCEnv(gym.Env):
             # Get all jobs scheduled for carbon-aware reward
             scheduledJobs = [job for job in self.loads.all_jobs 
                            if hasattr(job, 'scheduled_time') and job.scheduled_time != -1]
-            carbonRwd = self.cluster.carbonIntensity.getCarbonAwareReward(
-                self.cluster.PowerStruc.powerSlotLog, scheduledJobs)
+            
+            # Verification: Check that jobs are tracked in power structure
+            if self.debug:
+                jobs_with_power_data = len(self.cluster.PowerStruc.jobPowerLogs)
+                scheduled_job_count = len(scheduledJobs)
+                
+                # Verify that scheduled jobs have power data
+                for job in scheduledJobs[:3]:  # Check first 3 jobs to avoid spam
+                    assert job.job_id in self.cluster.PowerStruc.jobPowerLogs, f"Scheduled job {job.job_id} should have power data"
+                    power_data = self.cluster.PowerStruc.getJobPowerConsumption(job.job_id)
+                    assert len(power_data) > 0, f"Job {job.job_id} should have non-empty power consumption data"
+            
+            # Use simplified post-scheduling carbon reward calculation
+            carbonRwd = self.cluster.carbonIntensity.getCarbonAwareReward(scheduledJobs)
 
             return [None, rwd, True, 0, 0, 0,len(self.running_jobs),carbonRwd]
 
@@ -1003,8 +1042,8 @@ class HPCEnv(gym.Env):
             # Get all jobs scheduled for carbon-aware reward
             scheduledJobs = [job for job in self.loads.all_jobs 
                            if hasattr(job, 'scheduled_time') and job.scheduled_time != -1]
-            carbonRwd = self.cluster.carbonIntensity.getCarbonAwareReward(
-                self.cluster.PowerStruc.powerSlotLog, scheduledJobs)
+            # Use simplified post-scheduling carbon reward calculation
+            carbonRwd = self.cluster.carbonIntensity.getCarbonAwareReward(scheduledJobs)
             return [None, rwd, True,len(self.running_jobs),carbonRwd]
 
 
@@ -1061,7 +1100,7 @@ class HPCEnv(gym.Env):
                         free_processors-= _j.request_number_of_processors
                         power_stru.update(_j.scheduled_time,
                                                        _j.scheduled_time + _j.request_time,
-                                                       _j.power)
+                                                       _j.power, _j.job_id)
                         runningJobs.append(_j)
                         score = self.job_score(_j)  # calculated reward
                         scheduled_logs[_j.job_id] = score
@@ -1106,7 +1145,7 @@ class HPCEnv(gym.Env):
             free_processors-=job_for_scheduling.request_number_of_processors
             Temp_power.update(job_for_scheduling.scheduled_time,
                                            job_for_scheduling.scheduled_time + job_for_scheduling.request_time,
-                                           job_for_scheduling.power)
+                                           job_for_scheduling.power, job_for_scheduling.job_id)
             runningJobs.append(job_for_scheduling)
             score = self.job_score1(job_for_scheduling)  # calculated reward
             scheduled_logs[job_for_scheduling.job_id] = score
@@ -1118,7 +1157,8 @@ class HPCEnv(gym.Env):
         
         # Get all jobs scheduled for carbon-aware reward
         scheduledJobs = [job for job in runningJobs if hasattr(job, 'scheduled_time') and job.scheduled_time != -1]
-        carbonRwd = self.cluster.carbonIntensity.getCarbonAwareReward(Temp_power.powerSlotLog, scheduledJobs)
+        # Use simplified post-scheduling carbon reward calculation
+        carbonRwd = self.cluster.carbonIntensity.getCarbonAwareReward(scheduledJobs)
 
         return rwd1,carbonRwd
 

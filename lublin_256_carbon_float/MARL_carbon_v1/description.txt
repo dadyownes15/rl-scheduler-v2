@@ -1,0 +1,4 @@
+Experiment: MARL_carbon_v1
+Workload: lublin_256_carbon_float
+Timestamp: 2025-06-19 08:41:23
+Description: Carbon-aware scheduling with no backfilling

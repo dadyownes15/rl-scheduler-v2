@@ -1,6 +1,8 @@
 import os
-
 import csv
+import shutil
+import configparser
+from datetime import datetime
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -460,15 +462,71 @@ class PPO():
             ac2 = dist_bin2.sample()
 
         return ac1, ac2
+
+def setup_experiment_directory(workload, experiment_name, description):
+    """
+    Setup the experiment directory structure:
+    workload/
+      └── MARL_experiment_name/
+          ├── description.txt
+          ├── config.ini (copy)
+          ├── checkpoints/
+          │   ├── epoch_5/
+          │   ├── epoch_10/
+          │   └── ...
+          └── final/
+    """
+    
+    # Create experiment directory
+    experiment_dir = f"{workload}/MARL_{experiment_name}"
+    os.makedirs(experiment_dir, exist_ok=True)
+    os.makedirs(f"{experiment_dir}/checkpoints", exist_ok=True)
+    os.makedirs(f"{experiment_dir}/final", exist_ok=True)
+    
+    # Save description
+    if description:
+        with open(f"{experiment_dir}/description.txt", 'w') as f:
+            f.write(f"Experiment: MARL_{experiment_name}\n")
+            f.write(f"Workload: {workload}\n")
+            f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Description: {description}\n")
+    
+    # Save complete configuration snapshot
+    with open(f"{experiment_dir}/config_snapshot.ini", 'w') as f:
+        # Read current config
+        config = configparser.ConfigParser()
+        config.read('configFile/config.ini')
         
-def train(workload, backfill, debug=False):
-    print("Traing called")
+        # Write header comment
+        f.write(f"# Configuration snapshot for experiment MARL_{experiment_name}\n")
+        f.write(f"# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"# All constants and parameters used for this experiment\n\n")
+        
+        # Write all config sections
+        for section in config.sections():
+            f.write(f"[{section}]\n")
+            for key, value in config.items(section):
+                f.write(f"{key} = {value}\n")
+            f.write("\n")
+    
+    return experiment_dir
+        
+def train(workload, backfill, debug=False, experiment_name="", description=""):
+    print("Training called")
     # ------------------------------------------------------------------
     # 1. Experiment-wide hyper-parameters & environment construction
     # ------------------------------------------------------------------
-    seed       = 0
-    epochs     = 300          # how many training loops over the dataset
-    traj_num   = 100          # trajectories per epoch (episodes)
+    # Read training parameters from config
+    config = configparser.ConfigParser()
+    config.read('configFile/config.ini')
+    
+    seed       = int(config.get('training parameters', 'seed'))
+    epochs     = int(config.get('training parameters', 'epochs'))
+    traj_num   = int(config.get('training parameters', 'traj_num'))
+    
+    # Setup experiment directory structure
+    experiment_dir = setup_experiment_directory(workload, experiment_name, description)
+    print(f"Experiment directory: {experiment_dir}")
     
     if debug:
         print(f"DEBUG: Training parameters:")
@@ -676,8 +734,18 @@ def train(workload, backfill, debug=False):
         avg_green_reward = green_reward / traj_num
         avg_wait_reward = wait_reward / traj_num
         
-        with open(f"MARL_{workload}.csv", mode="a", newline="") as file:
+        # Save to experiment directory
+        csv_file = f"{experiment_dir}/training_results.csv"
+        # Write header if file doesn't exist
+        if not os.path.exists(csv_file):
+            with open(csv_file, mode="w", newline="") as file:
+                csv.writer(file).writerow([
+                    "epoch", "avg_epoch_reward", "avg_green_reward", "avg_wait_reward"
+                ])
+        
+        with open(csv_file, mode="a", newline="") as file:
             csv.writer(file).writerow([
+                epoch + 1,
                 avg_epoch_reward,
                 avg_green_reward,
                 avg_wait_reward
@@ -693,7 +761,7 @@ def train(workload, backfill, debug=False):
         
         # Save model weights every 5 epochs
         if (epoch + 1) % 5 == 0:
-            checkpoint_path = f"{workload}/MARL_checkpoints/epoch_{epoch + 1}/"
+            checkpoint_path = f"{experiment_dir}/checkpoints/epoch_{epoch + 1}/"
             ppo.save_using_model_name(checkpoint_path)
             if debug or (epoch + 1) % 10 == 0:
                 print(f"  Saved checkpoint at epoch {epoch + 1}: {checkpoint_path}")
@@ -704,7 +772,14 @@ def train(workload, backfill, debug=False):
     # ------------------------------------------------------------------
     # 8. Persist the trained model
     # ------------------------------------------------------------------
-    ppo.save_using_model_name(f"{workload}/MARL/")
+    final_model_path = f"{experiment_dir}/final/"
+    ppo.save_using_model_name(final_model_path)
+    print(f"Final model saved to: {final_model_path}")
+    
+    # Also save in the legacy location for backward compatibility
+    legacy_path = f"{workload}/MARL/"
+    ppo.save_using_model_name(legacy_path)
+    print(f"Legacy model saved to: {legacy_path}")
 
 
 
@@ -712,8 +787,10 @@ def train(workload, backfill, debug=False):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--workload', type=str, default='lublin_256')
-    parser.add_argument('--backfill', type=int, default=0)
+    parser.add_argument('--workload', type=str, default='lublin_256', help='Workload dataset to use')
+    parser.add_argument('--backfill', type=int, default=0, help='Backfill strategy (0/1)')
     parser.add_argument('--debug', action='store_true', help='Enable debug prints')
+    parser.add_argument('--name', type=str, required=True, help='Experiment name (e.g., ED12)')
+    parser.add_argument('--description', type=str, default='', help='Description of the experiment')
     args = parser.parse_args()
-    train(args.workload, args.backfill, args.debug)
+    train(args.workload, args.backfill, args.debug, args.name, args.description)

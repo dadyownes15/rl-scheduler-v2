@@ -9,7 +9,7 @@ from MaskablePPO import PPO
 from MaskablePPO_Carbon import PPO as PPO_Carbon
 from GA import GA
 from  MARL import PPO as MARL
-from  MARL_Plus import PPO as MARL_Plus
+# from  MARL_Plus import PPO as MARL_Plus
 
 
 def column_averages(matrix):
@@ -191,11 +191,11 @@ def run_policy(env, nums, iters):
         reward1, greenRwd=RL_MultiAction(model,env)
         MARL_r.append([-reward1,greenRwd,eta*reward1+greenRwd])
         env.reset_for_test(nums, start)
-
+        """ 
         model=load_policy('MARL_Plus', MARL_Plus_path)
         reward1, greenRwd=RL_MultiAction(model,env)
         MARL_Plus_r.append([-reward1,greenRwd,eta*reward1+greenRwd])
-        env.reset_for_test(nums, start)
+        env.reset_for_test(nums, start) """
 
     algorithms = {
         "FCFS": column_averages(fcfs_r),
@@ -204,8 +204,8 @@ def run_policy(env, nums, iters):
         "GA": column_averages(GA_r),
         "PPO": column_averages(PPO_r),
         "PPO_Carbon": column_averages(PPO_Carbon_r),
-        "MARL": column_averages(MARL_r),
-        "MARL_Plus": column_averages(MARL_Plus_r),
+        "MARL": column_averages(MARL_r)
+       # "MARL_Plus": column_averages(MARL_Plus_r),
     }
 
     filtered_results = {

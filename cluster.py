@@ -1,5 +1,5 @@
 import math
-from PowerStruc import power_struc
+from PowerStruc import power_struc_carbon
 from greenPower import carbon_intensity
 
 class Machine:
@@ -47,9 +47,15 @@ class Cluster:
         self.num_procs_per_node = num_procs_per_node
         self.all_nodes = []
         self.statPower = idlePower*math.ceil(self.total_node / processor_per_machine)
-        self.PowerStruc = power_struc(self.statPower)
+        self.PowerStruc = power_struc_carbon(self.statPower)
         self.carbonIntensity = carbon_intensity(greenWin, year)
         self.green_win = greenWin
+        
+        # Verification: Ensure power_struc_carbon is properly initialized
+        assert hasattr(self.PowerStruc, 'jobPowerLogs'), "PowerStruc should have jobPowerLogs for per-job tracking"
+        assert hasattr(self.PowerStruc, 'update'), "PowerStruc should have update method"
+        assert hasattr(self.PowerStruc, 'getJobPowerConsumption'), "PowerStruc should have getJobPowerConsumption method"
+
         for i in range(self.total_node):
             self.all_nodes.append(Machine(i))
 
@@ -108,7 +114,7 @@ class Cluster:
     def reset(self):
         self.used_node = 0
         self.free_node = self.total_node
-        self.PowerStruc = power_struc(self.statPower)
+        self.PowerStruc = power_struc_carbon(self.statPower)
         for m in self.all_nodes:
             m.reset()
 

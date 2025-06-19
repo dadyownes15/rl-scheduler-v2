@@ -1,6 +1,6 @@
 from random import shuffle
 from HPCSimPickJobs import *
-from PowerStruc import power_struc
+from PowerStruc import power_struc_carbon
 import random
 import os
 def twoQs_function(tl):
@@ -169,8 +169,8 @@ class GA():
         return crossed1, crossed2
 
     def run(self,env):
-        temp_power = power_struc(env.cluster.statPower)
-        temp_power.powerSlotLog = env.cluster.PowerStruc.getSlotFromRunning(env.running_jobs, env.current_timestamp)
+        temp_power = power_struc_carbon(env.cluster.statPower)
+        # power_struc_carbon doesn't need powerSlotLog - it tracks jobs internally
 
         task_list=env.job_queue
         self.init(task_list)

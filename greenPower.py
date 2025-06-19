@@ -1,59 +1,18 @@
 import csv
 import os
+import configparser
 
-# Define MAX_CARBON_INTENSITY constant
-MAX_CARBON_INTENSITY = 467.25  # Maximum carbon intensity in gCO₂eq/kWh
+# Load configuration
+config = configparser.ConfigParser()
+config.read('configFile/config.ini')
 
-def dataLoad(fileName, year=2002):
-    column = year - 2006
-    listByYear = []
-    for col in range(column ,column+3):
-        f = open(fileName, 'rt')
-        reader = csv.reader(f)
-        next(reader)
-        for row in reader:
-            listByYear.append(float(row[col]))
+# Carbon window configuration
+USE_DYNAMIC_WINDOW = config.getboolean('carbon setting', 'USE_DYNAMIC_WINDOW', fallback=True)  # If True, use dynamic window from scheduled time to last job end
+                          # If False, use fixed 24-hour window from scheduled time
 
-        f.close()
-    return listByYear
-
-def wtProducedPower(windSpeedList, turbinePowerNominal,cutInSpeed=2.5,
-                    cutOffSpeed=30, ratedOutputSpeed=15):
-    wPower = [0.0] * len(windSpeedList)
-    for i in range(len(windSpeedList)):
-        if windSpeedList[i] > cutInSpeed and windSpeedList[i] < cutOffSpeed:
-            if windSpeedList[i] < ratedOutputSpeed:
-                wPower[i] = round((turbinePowerNominal *
-                                   ((windSpeedList[i]) - (cutInSpeed))) /
-                                  ((ratedOutputSpeed) - (cutInSpeed)), 2)
-            else:
-                wPower[i] = round(turbinePowerNominal, 2)
-    return wPower
-
-def solarProducedPower(irradiance, pvEfficiency, numberPv):
-    solarPower = [0] * len(irradiance)
-    for i in range(len(irradiance)):
-        solarPower[i] = round(
-            ((pvEfficiency * irradiance[i] * numberPv)), 2)
-    return solarPower
-
-def renewablePowerProduced(numberPv,turbinePowerNominal):
-    current_dir = os.getcwd()
-    wind_file = os.path.join(current_dir, "./data/windspeedS.csv")
-    solar_file=os.path.join(current_dir, "./data/irradianceS.csv")
-
-    windListes = dataLoad(wind_file, 2007)
-    windPowerLists = wtProducedPower(windListes, turbinePowerNominal)
-
-
-    pvEfficiency = 0.2
-    solarLists = dataLoad(solar_file, 2007)
-    solarPowerLists = solarProducedPower(
-        solarLists, pvEfficiency, numberPv)
-
-    renewable = [a + b for a, b in zip(solarPowerLists , windPowerLists)]
-
-    return renewable
+# Maximum carbon intensity for normalization (gCO2eq/kWh)
+# Based on the historical maximum from DK data: ~467.25, rounded up to 500 for safety
+MAX_CARBON_INTENSITY = float(config.get('algorithm constants', 'MAX_CARBON_INTENSITY')) 
 
 class carbon_intensity():
     def __init__(self, greenWin, year=2021):
@@ -65,6 +24,15 @@ class carbon_intensity():
         self.greenWin = greenWin
         self.year = year
         self.carbonIntensityList = self.loadCarbonIntensityData()
+        # How many hours we shift the carbon-intensity timeline (set each episode)
+        self.start_offset = 0
+    
+    # -------------------------------------------------
+    #  Helpers for the environment to control the offset
+    # -------------------------------------------------
+    def setStartOffset(self, offset_hours: int):
+        """Shift the carbon-intensity timeline by <offset_hours> (0-8759)."""
+        self.start_offset = offset_hours % len(self.carbonIntensityList)
     
     def loadCarbonIntensityData(self):
         """Load carbon intensity data from CSV file"""
@@ -94,8 +62,8 @@ class carbon_intensity():
         t = currentTime
         
         for i in range(index, index + self.greenWin):
-            # Handle wrap-around for year-long data
-            hour_index = i % len(self.carbonIntensityList)
+            # Handle wrap-around for year-long data with start offset
+            hour_index = (i + self.start_offset) % len(self.carbonIntensityList)
             carbonIntensity = self.carbonIntensityList[hour_index]
             lastTime = (i + 1) * 3600 - t
             carbonSlot.append({'lastTime': lastTime, 'carbonIntensity': carbonIntensity})
@@ -121,8 +89,8 @@ class carbon_intensity():
             else:
                 lastTime = (i + 1) * 3600 - t
             
-            # Handle wrap-around for year-long data
-            hour_index = i % len(self.carbonIntensityList)
+            # Handle wrap-around for year-long data with start offset
+            hour_index = (i + self.start_offset) % len(self.carbonIntensityList)
             carbonIntensity = self.carbonIntensityList[hour_index]  # gCO2eq/kWh
             
             # Convert power from watts to kW and time from seconds to hours
@@ -134,138 +102,358 @@ class carbon_intensity():
         
         return totalEmissions
     
-    def getCarbonIntensityUtilization(self, powerSlot):
-        """
-        Calculate average carbon intensity for the power consumption profile
-        Returns: weighted average carbon intensity (gCO2eq/kWh)
-        """
-        totalEnergy = 0
-        totalEmissions = 0
-        
-        for i in range(len(powerSlot) - 1):
-            power = powerSlot[i]['power']
-            start = powerSlot[i]['timeSlot']
-            end = powerSlot[i + 1]['timeSlot']
-            lastTime = end - start
-            
-            energyKWh = (power / 1000.0) * (lastTime / 3600.0)
-            totalEnergy += energyKWh
-            
-            emissions = self.getCarbonEmissions(power, start, end)
-            totalEmissions += emissions
-        
-        if totalEnergy == 0:
-            return 0
-        else:
-            return totalEmissions / totalEnergy  # Average carbon intensity
-    
-    def getCarbonEmissionsEstimate(self, power, start, end, minIndex, maxIndex):
-        """
-        Estimate carbon emissions within a time window (for backfill checks)
-        """
-        totalEmissions = 0
-        startIndex = int(start / 3600)
-        endIndex = int(end / 3600)
-        t = start
-        
-        for i in range(startIndex, endIndex + 1):
-            if i == endIndex:
-                lastTime = end - t
-            else:
-                lastTime = (i + 1) * 3600 - t
-            
-            # Use window-based indexing for estimates
-            if i > maxIndex:
-                hour_index = (minIndex + (i - minIndex) % (maxIndex - minIndex + 1)) % len(self.carbonIntensityList)
-            else:
-                hour_index = i % len(self.carbonIntensityList)
-            
-            carbonIntensity = self.carbonIntensityList[hour_index]
-            energyKWh = (power / 1000.0) * (lastTime / 3600.0)
-            emissions = energyKWh * carbonIntensity
-            totalEmissions += emissions
-            
-            t = (i + 1) * 3600
-        
-        return totalEmissions
+    # Simple wrapper used by Cluster.backfill_check(..)
+    def getCarbonEmissionsEstimate(self, power, start, end, *_):
+        return self.getCarbonEmissions(power, start, end)
 
-    def getCarbonAwareReward(self, powerSlot, jobList):
+    def getWorstCarbonIntensitiesInPeriod(self, start_time, end_time, job_length_seconds):
         """
-        Calculate carbon-aware reward that considers job carbon consideration indices
-        Higher carbon consideration = higher penalty for emissions
-        Lower carbon consideration = lower penalty for emissions
+        Get the list of carbon intensities that would be used in worst-case calculation,
+        accounting for fractional hours.
         
         Args:
-            powerSlot: power consumption slots
-            jobList: list of jobs with their carbon_consideration indices
+            start_time: start of the time window in seconds
+            end_time: end of the time window in seconds  
+            job_length_seconds: duration of the job in seconds
+            
+        Returns:
+            List of (intensity, hours_used) tuples showing which intensities are used and for how long
+        """
+        # Input validation
+        assert start_time >= 0, "start_time must be non-negative"
+        assert end_time > start_time, "end_time must be greater than start_time"
+        assert job_length_seconds > 0, "job_length_seconds must be positive"
+        
+        window_duration = end_time - start_time
+        assert window_duration >= job_length_seconds, \
+            f"Time window ({window_duration}s) must be at least as long as job length ({job_length_seconds}s)"
+            
+        # Convert job length to hours (exact, no ceiling)
+        job_length_hours = job_length_seconds / 3600.0
+        
+        # Get all carbon intensities in the time window
+        start_hour = int(start_time / 3600)
+        end_hour = int(end_time / 3600)
+        
+        intensities = []
+        for hour in range(start_hour, end_hour + 1):
+            # Apply start offset and wrap around year
+            hour_index = (hour + self.start_offset) % len(self.carbonIntensityList)
+            intensity = self.carbonIntensityList[hour_index]
+            intensities.append(intensity)
+            
+        # Sort intensities in descending order (worst first)
+        intensities.sort(reverse=True)
+        
+        # Calculate which intensities are used and for how long
+        used_intensities = []
+        remaining_hours = job_length_hours
+        
+        for intensity in intensities:
+            if remaining_hours <= 0:
+                break
+                
+            # Take full hour or remaining fraction
+            hours_to_use = min(1.0, remaining_hours)
+            used_intensities.append((intensity, hours_to_use))
+            remaining_hours -= hours_to_use
+        
+        # If we have a partial hour remaining, use the least intensity available
+        if remaining_hours > 0:
+            # Sort intensities in ascending order to get the least
+            intensities_asc = sorted(intensities)
+            if intensities_asc:
+                least_intensity = intensities_asc[0]
+                used_intensities.append((least_intensity, remaining_hours))
+        
+        return used_intensities
+
+    def getMaxCarbonIntensityInPeriod(self, start_time, end_time, job_length_seconds):
+        """
+        Find the worst carbon intensities within a time window for a job of given length,
+        accounting for fractional hours to remove ceiling bias.
+        
+        For partial hours, the least carbon intensity is used (best case for that fraction).
+        
+        Args:
+            start_time: start of the time window in seconds
+            end_time: end of the time window in seconds  
+            job_length_seconds: duration of the job in seconds
+            
+        Returns:
+            Weighted sum of carbon intensities (gCO2eq/kWh) accounting for fractional hours
+        """
+        # Input validation
+        assert start_time >= 0, "start_time must be non-negative"
+        assert end_time > start_time, "end_time must be greater than start_time"
+        assert job_length_seconds > 0, "job_length_seconds must be positive"
+        
+            
+        # Convert job length to hours (exact, no ceiling)
+        job_length_hours = job_length_seconds / 3600.0
+        
+        # Get all carbon intensities in the time window
+        start_hour = int(start_time / 3600)
+        end_hour = int(end_time / 3600)
+        
+        intensities = []
+        for hour in range(start_hour, end_hour + 1):
+            # Apply start offset and wrap around year
+            hour_index = (hour + self.start_offset) % len(self.carbonIntensityList)
+            intensity = self.carbonIntensityList[hour_index]
+            intensities.append(intensity)
+            
+        # Sort intensities in descending order (worst first)
+        intensities.sort(reverse=True)
+        
+        # Calculate weighted sum accounting for fractional hours
+        total_weighted_intensity = 0.0
+        remaining_hours = job_length_hours
+        
+        for intensity in intensities:
+            if remaining_hours <= 0:
+                break
+                
+            # Take full hour or remaining fraction
+            hours_to_use = min(1.0, remaining_hours)
+            total_weighted_intensity += intensity * hours_to_use
+            remaining_hours -= hours_to_use
+        
+        # If we have a partial hour remaining, use the least intensity available
+        # (best case for the partial hour to reduce bias)
+        if remaining_hours > 0:
+            # Sort intensities in ascending order to get the least
+            intensities_asc = sorted(intensities)
+            if intensities_asc:
+                least_intensity = intensities_asc[0]
+                total_weighted_intensity += least_intensity * remaining_hours
+        
+        return total_weighted_intensity
+
+    def getMaxCarbonIntensityFromJobs(self, scheduled_jobs):
+        """
+        Get the worst-case carbon intensities for all scheduled jobs.
+        Window configuration controlled by USE_DYNAMIC_WINDOW:
+        - If True: dynamic window from each job's scheduled time to when last job ends
+        - If False: fixed 24-hour window from each job's scheduled time
+        
+        Args:
+            scheduled_jobs: list of jobs with submit_time, scheduled_time, and request_time attributes
+            
+        Returns:
+            Dictionary with job-wise worst-case carbon intensity sums
+        """
+        if not scheduled_jobs:
+            return {}
+            
+        # Filter out unscheduled jobs
+        valid_jobs = [job for job in scheduled_jobs 
+                     if hasattr(job, 'scheduled_time') and job.scheduled_time != -1]
+        
+        if not valid_jobs:
+            return {}
+        
+        # Determine window end time based on configuration
+        if USE_DYNAMIC_WINDOW:
+            # Dynamic window: find when the last job ends
+            last_job_end = max(job.scheduled_time + job.request_time for job in valid_jobs)
+
+        else:
+            # Fixed window will be calculated per job (24 hours from each job's start)
+            pass
+            
+        # Calculate worst-case carbon intensity for each job
+        results = {}
+        for i, job in enumerate(valid_jobs):
+            job_id = getattr(job, 'job_id', f'job_{i}')
+            
+            # Window configuration
+            window_start = job.scheduled_time
+            if USE_DYNAMIC_WINDOW:
+                # Dynamic: window from job start to when last job ends
+                window_end = last_job_end
+            else:
+                # Fixed: 24-hour window from job start
+                window_end = job.scheduled_time + (24 * 3600)  # 24 hours in seconds
+            
+            # Ensure window is at least as long as the job
+            min_window_end = job.scheduled_time + job.request_time
+            window_end = max(window_end, min_window_end)
+            
+            worst_case = self.getMaxCarbonIntensityInPeriod(
+                window_start, 
+                window_end, 
+                job.request_time
+            )
+            results[job_id] = worst_case
+            
+        return results
+    
+    def getWorstCaseForSingleJob(self, start_window, end_window, job_length_seconds):
+        """
+        Convenience function for analyzing a single job's worst-case carbon exposure.
+        
+        Args:
+            start_window: earliest possible start time (seconds)
+            end_window: latest possible end time (seconds)
+            job_length_seconds: job duration in seconds
+            
+        Returns:
+            Sum of worst N carbon intensities the job could experience
+        """
+        return self.getMaxCarbonIntensityInPeriod(start_window, end_window, job_length_seconds)
+
+    def getCarbonAwareReward(self, scheduledJobs):
+        """
+        Calculate carbon-aware reward for post-scheduling evaluation.
+        Reward is based on the average of carbon-consideration-weighted emission ratios.
+        Higher carbon consideration makes the job's performance impact the reward more.
+        
+        Args:
+            scheduledJobs: list of jobs with scheduled_time, submit_time, request_time, power, carbon_consideration
         
         Returns:
             Carbon-aware reward (negative value, higher magnitude = worse)
         """
-        totalWeightedEmissions = 0
-        totalEnergy = 0
-        
-        for i in range(len(powerSlot) - 1):
-            power = powerSlot[i]['power']
-            start = powerSlot[i]['timeSlot']
-            end = powerSlot[i + 1]['timeSlot']
-            lastTime = end - start
-            
-            energyKWh = (power / 1000.0) * (lastTime / 3600.0)
-            totalEnergy += energyKWh
-            
-            emissions = self.getCarbonEmissions(power, start, end)
-            
-            # Calculate weighted emissions based on jobs running during this period
-            carbonWeight = self.calculateCarbonWeight(jobList, start, end)
-            weightedEmissions = emissions * carbonWeight
-            totalWeightedEmissions += weightedEmissions
-        
-        if totalEnergy == 0:
-            return 0
-        else:
-            # Return negative reward (penalty) - higher emissions = more negative
-            avgWeightedCarbonIntensity = totalWeightedEmissions / totalEnergy
-            # Normalize by max carbon intensity and convert to penalty
-            return -(avgWeightedCarbonIntensity / MAX_CARBON_INTENSITY)
-    
-    def calculateCarbonWeight(self, jobList, start, end):
-        """
-        Calculate the carbon consideration weight for a time period
-        based on jobs running during that time
-        
-        Args:
-            jobList: list of jobs with carbon_consideration and timing info
-            start, end: time period
-            
-        Returns:
-            Weight factor (0.0 to 1.0, where 1.0 = highest carbon concern)
-        """
-        if not jobList:
-            return 0.0  # No jobs, no carbon consideration
-        
-        runningJobs = []
-        for job in jobList:
-            jobStart = getattr(job, 'scheduled_time', -1)
-            jobEnd = jobStart + getattr(job, 'request_time', 0) if jobStart != -1 else -1
-            
-            # Check if job overlaps with the time period
-            if jobStart != -1 and jobStart < end and jobEnd > start:
-                runningJobs.append(job)
-        
-        if not runningJobs:
-            return 0.0  # No running jobs, no carbon consideration
-        
-        # Calculate average carbon consideration of running jobs
-        totalCarbonConsideration = sum(getattr(job, 'carbon_consideration', 0) for job in runningJobs)
-        avgCarbonConsideration = totalCarbonConsideration / len(runningJobs)
-        
-        # If all jobs have carbon consideration 0, return weight 0 (no carbon optimization)
-        if avgCarbonConsideration == 0:
+        if not scheduledJobs:
             return 0.0
         
-        # Convert 0-4 scale to 0.2-1.0 weight scale for non-zero considerations
-        # 1 (low concern) -> 0.2 weight (light penalty)
-        # 4 (highest concern) -> 1.0 weight (full penalty)
-        weight = 0.2 + ((avgCarbonConsideration - 1) / 3.0) * 0.8
-        return max(0.2, weight)  # Ensure minimum 0.2 for any non-zero consideration
+        # Filter out unscheduled jobs
+        valid_jobs = [job for job in scheduledJobs 
+                     if hasattr(job, 'scheduled_time') and job.scheduled_time != -1]
+        
+        if not valid_jobs:
+            return 0.0
+        
+        # Get worst-case carbon intensities for all jobs
+        worst_case_intensities = self.getMaxCarbonIntensityFromJobs(valid_jobs)
+        
+        total_weighted_ratios = 0
+        job_count = 0
+        
+        # Process each job individually
+        for job in valid_jobs:
+            if not hasattr(job, 'scheduled_time') or job.scheduled_time == -1:
+                continue  # Skip unscheduled jobs
+            
+            # Job data
+            job_id = getattr(job, 'job_id', 'unknown')
+            start_time = job.scheduled_time
+            end_time = start_time + job.request_time
+            power = job.power  # watts
+            carbon_consideration = getattr(job, 'carbon_consideration', 0)
+            
+            if carbon_consideration == 0:
+                continue  # Skip jobs with no carbon consideration
+            
+            # Calculate actual carbon emissions for this job's scheduled time
+            actual_emissions = self.getCarbonEmissions(power, start_time, end_time)
+            
+            # Get worst-case carbon emissions
+            # getMaxCarbonIntensityInPeriod now returns weighted sum directly
+            worst_case_intensity_weighted_sum = worst_case_intensities.get(job_id, 0)
+            
+            # Convert to emissions: weighted_sum represents total intensity exposure
+            # for the job duration, so we multiply by power and convert to emissions
+            duration_hours = (end_time - start_time) / 3600.0
+            energy_kwh = (power / 1000.0) * duration_hours
+            
+            # The weighted sum already accounts for the job duration, so we need the average
+            avg_worst_case_intensity = worst_case_intensity_weighted_sum / duration_hours
+            worst_case_emissions = energy_kwh * avg_worst_case_intensity
+            
+            # Calculate ratio of actual to worst-case emissions
+            if worst_case_emissions > 0:
+                emission_ratio = actual_emissions / worst_case_emissions
+            else:
+                emission_ratio = 0.0
+            
+            # Weight the ratio by carbon consideration (higher consideration = more impact)
+            weighted_ratio = emission_ratio * carbon_consideration
+            total_weighted_ratios += weighted_ratio
+            job_count += 1
+        
+        if job_count == 0:
+            return 0.0
+        
+        # Calculate simple average of weighted ratios
+        avg_weighted_ratio = total_weighted_ratios / job_count
+        
+        # Return negative reward (penalty) - higher carbon consideration jobs with worse ratios = worse reward
+        return -avg_weighted_ratio
+
+    def getCarbonMetrics(self, scheduledJobs):
+        """
+        Calculate comprehensive carbon metrics for post-scheduling analysis.
+        
+        Args:
+            scheduledJobs: list of jobs with timing, power, and carbon consideration data
+            
+        Returns:
+            Dictionary with carbon metrics:
+            - total_emissions: total CO2 emissions (gCO2eq)
+            - total_energy: total energy consumption (kWh) 
+            - avg_carbon_intensity: average carbon intensity (gCO2eq/kWh)
+            - weighted_emissions: carbon-consideration-weighted emissions
+            - per_job_metrics: list of per-job carbon data
+        """
+        if not scheduledJobs:
+            return {
+                'total_emissions': 0,
+                'total_energy': 0, 
+                'avg_carbon_intensity': 0,
+                'weighted_emissions': 0,
+                'per_job_metrics': []
+            }
+        
+        total_emissions = 0
+        total_energy = 0
+        total_weighted_emissions = 0
+        per_job_metrics = []
+        
+        for job in scheduledJobs:
+            if not hasattr(job, 'scheduled_time') or job.scheduled_time == -1:
+                continue
+                
+            # Job data
+            start_time = job.scheduled_time
+            end_time = start_time + job.request_time
+            power = job.power
+            carbon_consideration = getattr(job, 'carbon_consideration', 0)
+            
+            # Calculate metrics for this job
+            duration_hours = (end_time - start_time) / 3600.0
+            energy_kwh = (power / 1000.0) * duration_hours
+            emissions = self.getCarbonEmissions(power, start_time, end_time)
+            
+            # Carbon consideration directly scales the penalty
+            weighted_emissions = emissions * carbon_consideration
+            
+            # Accumulate totals
+            total_energy += energy_kwh
+            total_emissions += emissions
+            total_weighted_emissions += weighted_emissions
+            
+            # Store per-job metrics
+            per_job_metrics.append({
+                'job_id': getattr(job, 'job_id', 'unknown'),
+                'start_time': start_time,
+                'end_time': end_time,
+                'duration_hours': duration_hours,
+                'power_watts': power,
+                'energy_kwh': energy_kwh,
+                'emissions_gco2eq': emissions,
+                'carbon_consideration': carbon_consideration,
+                'weighted_emissions': weighted_emissions
+            })
+        
+        # Calculate overall metrics
+        avg_carbon_intensity = total_emissions / total_energy if total_energy > 0 else 0
+        
+        return {
+            'total_emissions': total_emissions,
+            'total_energy': total_energy,
+            'avg_carbon_intensity': avg_carbon_intensity, 
+            'weighted_emissions': total_weighted_emissions,
+            'per_job_metrics': per_job_metrics
+        }
