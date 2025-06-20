@@ -1,0 +1,250 @@
+================================================================================
+JOB REGRESSION ANALYSIS REPORT
+================================================================================
+Generated on: 2025-06-20 08:24:50
+Input file: lublin_256_carbon_float/MARL_green_backfill/validation_results/epoch_55/job_details_enhanced.csv
+Experiment: lublin_256_carbon_float/MARL_green_backfill
+Epoch: epoch_55
+================================================================================
+Loading data from lublin_256_carbon_float/MARL_green_backfill/validation_results/epoch_55/job_details_enhanced.csv...
+Loaded 5120 records
+
+Dataset Info:
+Shape: (5120, 19)
+Columns: ['job_id', 'submit_time', 'request_time', 'request_processors', 'carbon_consideration', 'queue_length_at_submission', 'submission_timestamp', 'user_id', 'power', 'scheduled_time', 'completion_time', 'wait_time', 'actual_runtime', 'action1', 'action2', 'scheduled', 'completed', 'carbon_emissions', 'carbon_reward']
+
+No missing values found
+
+Basic statistics for key columns:
+       request_time  request_processors  carbon_consideration  queue_length_at_submission          power      wait_time  carbon_emissions
+count   5120.000000         5120.000000           5120.000000                 5120.000000    5120.000000    5120.000000       5120.000000
+mean    4884.384570           22.325586              0.502482                   47.797852   11162.792969   41907.940820       3689.043432
+std     8089.434552           43.274945              0.286708                   23.003451   21637.472660   61973.153328      13406.022816
+min        1.000000            1.000000              0.000086                    1.000000     500.000000       3.000000          0.012072
+25%       21.000000            2.000000              0.252845                   31.000000    1000.000000    6708.250000          1.543900
+50%      149.000000            8.000000              0.504256                   48.000000    4000.000000   19803.000000         17.688198
+75%     8323.750000           19.000000              0.747336                   65.000000    9500.000000   46005.500000        697.664940
+max    76316.000000          256.000000              0.999900                  101.000000  128000.000000  473210.000000     337622.315022
+
+Creating feature matrix...
+Created 18 features:
+Base features: ['request_time', 'request_processors', 'carbon_consideration', 'queue_length_at_submission', 'power', 'wait_time']
+Interaction features: ['power_x_runtime', 'power_x_processors', 'queue_x_processors', 'queue_x_runtime', 'carbon_x_power', 'carbon_x_runtime', 'carbon_x_queue', 'processors_x_runtime', 'wait_x_runtime', 'wait_x_processors', 'log_power_per_processor', 'log_wait_per_queue']
+
+============================================================
+OLS REGRESSION ANALYSIS FOR CARBON EMISSIONS
+============================================================
+
+REGRESSION RESULTS:
+                            OLS Regression Results                            
+==============================================================================
+Dep. Variable:       carbon_emissions   R-squared:                       0.863
+Model:                            OLS   Adj. R-squared:                  0.863
+Method:                 Least Squares   F-statistic:                     2009.
+Date:                Fri, 20 Jun 2025   Prob (F-statistic):               0.00
+Time:                        08:24:51   Log-Likelihood:                -50834.
+No. Observations:                5120   AIC:                         1.017e+05
+Df Residuals:                    5103   BIC:                         1.018e+05
+Df Model:                          16                                         
+Covariance Type:            nonrobust                                         
+==============================================================================================
+                                 coef    std err          t      P>|t|      [0.025      0.975]
+----------------------------------------------------------------------------------------------
+const                      -1371.6216   2200.160     -0.623      0.533   -5684.878    2941.635
+request_time                   0.0446      0.030      1.476      0.140      -0.015       0.104
+request_processors             0.0001   5.56e-05      2.121      0.034    8.91e-06       0.000
+carbon_consideration         500.2030    604.029      0.828      0.408    -683.953    1684.359
+queue_length_at_submission    20.3270      6.924      2.936      0.003       6.754      33.900
+power                          0.0381      0.015      2.504      0.012       0.008       0.068
+wait_time                     -0.0228      0.004     -5.897      0.000      -0.030      -0.015
+power_x_runtime             3.731e-05   4.56e-07     81.786      0.000    3.64e-05    3.82e-05
+power_x_processors          -9.08e-05   6.29e-05     -1.444      0.149      -0.000    3.25e-05
+queue_x_processors            -0.5102      0.073     -6.982      0.000      -0.653      -0.367
+queue_x_runtime               -0.0004      0.000     -0.997      0.319      -0.001       0.000
+carbon_x_power                -0.0169      0.012     -1.375      0.169      -0.041       0.007
+carbon_x_runtime              -0.0532      0.034     -1.577      0.115      -0.119       0.013
+carbon_x_queue                -8.7780     10.547     -0.832      0.405     -29.455      11.899
+processors_x_runtime        -2.84e-07   5.48e-07     -0.518      0.604   -1.36e-06     7.9e-07
+wait_x_runtime              4.233e-07   1.17e-07      3.607      0.000    1.93e-07    6.53e-07
+wait_x_processors           4.792e-05   2.27e-05      2.113      0.035    3.47e-06    9.24e-05
+log_power_per_processor      -85.2597    351.265     -0.243      0.808    -773.889     603.370
+log_wait_per_queue           250.9027     93.256      2.690      0.007      68.080     433.725
+==============================================================================
+Omnibus:                     7844.823   Durbin-Watson:                   1.932
+Prob(Omnibus):                  0.000   Jarque-Bera (JB):         21393307.554
+Skew:                           8.810   Prob(JB):                         0.00
+Kurtosis:                     319.181   Cond. No.                     3.13e+19
+==============================================================================
+
+Notes:
+[1] Standard Errors assume that the covariance matrix of the errors is correctly specified.
+[2] The smallest eigenvalue is 1.39e-17. This might indicate that there are
+strong multicollinearity problems or that the design matrix is singular.
+
+KEY METRICS:
+R-squared: 0.8630
+Adjusted R-squared: 0.8626
+F-statistic: 2008.9393
+F-statistic p-value: 0.0000e+00
+
+FEATURE IMPORTANCE (Top 10):
+                   feature  coefficient  abs_coefficient      p_value
+      carbon_consideration   500.203028       500.203028 4.076463e-01
+        log_wait_per_queue   250.902748       250.902748 7.158513e-03
+   log_power_per_processor   -85.259739        85.259739 8.082304e-01
+queue_length_at_submission    20.327001        20.327001 3.340749e-03
+            carbon_x_queue    -8.778029         8.778029 4.053089e-01
+        queue_x_processors    -0.510207         0.510207 3.281126e-12
+          carbon_x_runtime    -0.053207         0.053207 1.149197e-01
+              request_time     0.044566         0.044566 1.399278e-01
+                     power     0.038055         0.038055 1.231148e-02
+                 wait_time    -0.022773         0.022773 3.949728e-09
+
+SIGNIFICANT FEATURES (p < 0.05): 9
+                   feature   coefficient  abs_coefficient      p_value
+        log_wait_per_queue  2.509027e+02     2.509027e+02 7.158513e-03
+queue_length_at_submission  2.032700e+01     2.032700e+01 3.340749e-03
+        queue_x_processors -5.102074e-01     5.102074e-01 3.281126e-12
+                     power  3.805544e-02     3.805544e-02 1.231148e-02
+                 wait_time -2.277261e-02     2.277261e-02 3.949728e-09
+        request_processors  1.178288e-04     1.178288e-04 3.398285e-02
+         wait_x_processors  4.791587e-05     4.791587e-05 3.461732e-02
+           power_x_runtime  3.731294e-05     3.731294e-05 0.000000e+00
+            wait_x_runtime  4.232891e-07     4.232891e-07 3.125791e-04
+
+============================================================
+OLS REGRESSION ANALYSIS FOR WAIT TIME
+============================================================
+
+REGRESSION RESULTS:
+                            OLS Regression Results                            
+==============================================================================
+Dep. Variable:              wait_time   R-squared:                       1.000
+Model:                            OLS   Adj. R-squared:                  1.000
+Method:                 Least Squares   F-statistic:                 1.435e+28
+Date:                Fri, 20 Jun 2025   Prob (F-statistic):               0.00
+Time:                        08:24:51   Log-Likelihood:                 87455.
+No. Observations:                5120   AIC:                        -1.749e+05
+Df Residuals:                    5103   BIC:                        -1.748e+05
+Df Model:                          16                                         
+Covariance Type:            nonrobust                                         
+==============================================================================================
+                                 coef    std err          t      P>|t|      [0.025      0.975]
+----------------------------------------------------------------------------------------------
+const                       2.383e-10    4.1e-09      0.058      0.954   -7.79e-09    8.27e-09
+request_time                -1.01e-14   5.62e-14     -0.180      0.857    -1.2e-13       1e-13
+request_processors          2.888e-13   1.03e-16   2791.994      0.000    2.89e-13    2.89e-13
+carbon_consideration       -1.762e-11   1.12e-09     -0.016      0.987   -2.22e-09    2.19e-09
+queue_length_at_submission -4.423e-12   1.29e-11     -0.343      0.732   -2.97e-11    2.08e-11
+power                       -1.11e-15   2.83e-14     -0.039      0.969   -5.66e-14    5.44e-14
+wait_time                      1.0000   7.19e-15   1.39e+14      0.000       1.000       1.000
+power_x_runtime             2.317e-18   8.49e-19      2.728      0.006    6.52e-19    3.98e-18
+power_x_processors         -5.437e-17   1.17e-16     -0.464      0.642   -2.84e-16    1.75e-16
+queue_x_processors         -4.663e-15   1.36e-13     -0.034      0.973   -2.71e-13    2.62e-13
+queue_x_runtime            -1.397e-15   7.11e-16     -1.966      0.049   -2.79e-15   -3.99e-18
+carbon_x_power             -1.471e-15   2.29e-14     -0.064      0.949   -4.64e-14    4.34e-14
+carbon_x_runtime                    0   6.28e-14          0      1.000   -1.23e-13    1.23e-13
+carbon_x_queue             -1.705e-13   1.96e-11     -0.009      0.993   -3.87e-11    3.83e-11
+processors_x_runtime       -9.984e-16   1.02e-18   -978.525      0.000      -1e-15   -9.96e-16
+wait_x_runtime             -5.288e-18   2.18e-19    -24.202      0.000   -5.72e-18   -4.86e-18
+wait_x_processors          -3.388e-17   4.22e-17     -0.803      0.422   -1.17e-16    4.89e-17
+log_power_per_processor     8.185e-12   6.54e-10      0.013      0.990   -1.27e-09    1.29e-09
+log_wait_per_queue         -5.116e-13   1.74e-10     -0.003      0.998   -3.41e-10     3.4e-10
+==============================================================================
+Omnibus:                     5745.421   Durbin-Watson:                   1.727
+Prob(Omnibus):                  0.000   Jarque-Bera (JB):           595108.983
+Skew:                           5.744   Prob(JB):                         0.00
+Kurtosis:                      54.552   Cond. No.                     3.13e+19
+==============================================================================
+
+Notes:
+[1] Standard Errors assume that the covariance matrix of the errors is correctly specified.
+[2] The smallest eigenvalue is 1.39e-17. This might indicate that there are
+strong multicollinearity problems or that the design matrix is singular.
+
+KEY METRICS:
+R-squared: 1.0000
+Adjusted R-squared: 1.0000
+F-statistic: 14351943256145016053668249600.0000
+F-statistic p-value: 0.0000e+00
+
+FEATURE IMPORTANCE (Top 10):
+                   feature   coefficient  abs_coefficient  p_value
+                 wait_time  1.000000e+00     1.000000e+00 0.000000
+      carbon_consideration -1.762146e-11     1.762146e-11 0.987499
+   log_power_per_processor  8.185452e-12     8.185452e-12 0.990014
+queue_length_at_submission -4.423129e-12     4.423129e-12 0.731509
+        log_wait_per_queue -5.115908e-13     5.115908e-13 0.997649
+        request_processors  2.887919e-13     2.887919e-13 0.000000
+            carbon_x_queue -1.705303e-13     1.705303e-13 0.993071
+              request_time -1.010303e-14     1.010303e-14 0.857349
+        queue_x_processors -4.662937e-15     4.662937e-15 0.972660
+            carbon_x_power -1.471046e-15     1.471046e-15 0.948808
+
+SIGNIFICANT FEATURES (p < 0.05): 6
+             feature   coefficient  abs_coefficient       p_value
+           wait_time  1.000000e+00     1.000000e+00  0.000000e+00
+  request_processors  2.887919e-13     2.887919e-13  0.000000e+00
+     queue_x_runtime -1.397320e-15     1.397320e-15  4.934711e-02
+processors_x_runtime -9.983550e-16     9.983550e-16  0.000000e+00
+      wait_x_runtime -5.287603e-18     5.287603e-18 1.360056e-122
+     power_x_runtime  2.317482e-18     2.317482e-18  6.385794e-03
+
+================================================================================
+COMPREHENSIVE REGRESSION ANALYSIS SUMMARY REPORT
+================================================================================
+
+DATASET OVERVIEW:
+- Total jobs analyzed: 5,120
+- Features used: 18
+- Date range: 803344 to 7566922
+
+TARGET VARIABLE STATISTICS:
+Carbon Emissions:
+  - Mean: 3689.0434
+  - Median: 17.6882
+  - Std Dev: 13406.0228
+  - Range: 0.0121 to 337622.3150
+
+Wait Time:
+  - Mean: 41908 seconds (11.6 hours)
+  - Median: 19803 seconds (5.5 hours)
+  - Std Dev: 61973 seconds
+  - Range: 3 to 473210 seconds
+
+MODEL PERFORMANCE:
+Carbon Emissions Model:
+  - R²: 0.8630
+  - Adjusted R²: 0.8626
+  - F-statistic: 2008.94 (p-value: 0.00e+00)
+
+Wait Time Model:
+  - R²: 1.0000
+  - Adjusted R²: 1.0000
+  - F-statistic: 14351943256145016053668249600.00 (p-value: 0.00e+00)
+
+TOP PREDICTORS:
+Carbon Emissions (Top 5):
+  - carbon_consideration: 5.0020e+02 (p=4.076e-01)
+  - log_wait_per_queue: 2.5090e+02 (p=7.159e-03)
+  - log_power_per_processor: -8.5260e+01 (p=8.082e-01)
+  - queue_length_at_submission: 2.0327e+01 (p=3.341e-03)
+  - carbon_x_queue: -8.7780e+00 (p=4.053e-01)
+
+Wait Time (Top 5):
+  - wait_time: 1.0000e+00 (p=0.000e+00)
+  - carbon_consideration: -1.7621e-11 (p=9.875e-01)
+  - log_power_per_processor: 8.1855e-12 (p=9.900e-01)
+  - queue_length_at_submission: -4.4231e-12 (p=7.315e-01)
+  - log_wait_per_queue: -5.1159e-13 (p=9.976e-01)
+
+KEY INSIGHTS:
+- 9 features significantly predict carbon emissions
+- Power-runtime interaction is a significant predictor of emissions
+- 6 features significantly predict wait time
+- Power and emissions correlation: 0.730
+- Queue length and wait time correlation: 0.037
+
+================================================================================
+ANALYSIS COMPLETED SUCCESSFULLY
+================================================================================

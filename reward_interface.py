@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+""" #!/usr/bin/env python3
 """
 Reward Function Interface System for HPC Job Scheduling
 
@@ -622,4 +622,4 @@ if __name__ == "__main__":
     # Example configuration
     print("\nExample reward manager usage:")
     manager = RewardManager()
-    print(f"Current reward function: {manager.get_reward_info()}") 
+    print(f"Current reward function: {manager.get_reward_info()}")  """

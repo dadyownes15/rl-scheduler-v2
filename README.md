@@ -457,23 +457,7 @@ green-rl-sched/
 - **📋 Progress Tracking**: Real-time training and validation monitoring
 - **🎯 Epoch Comparison**: Easy comparison across training stages
 
-## Citing GAS-MARL
 
-```
-If you reference or use GAS-MARL in your research, please cite:
-@article{CHEN2025107760,
-title = {GAS-MARL: Green-Aware job Scheduling algorithm for HPC clusters based on Multi-Action Deep Reinforcement Learning},
-journal = {Future Generation Computer Systems},
-volume = {167},
-pages = {107760},
-year = {2025},
-issn = {0167-739X},
-doi = {https://doi.org/10.1016/j.future.2025.107760},
-url = {https://www.sciencedirect.com/science/article/pii/S0167739X2500055X},
-author = {Rui Chen and Weiwei Lin and Huikang Huang and Xiaoying Ye and Zhiping Peng},
-keywords = {Job scheduling, High-performance computing, Deep Reinforcement Learning, Renewable energy, Green computing},
-}
-```
 
 ### Acknowledgment
 
@@ -481,7 +465,7 @@ We extend our heartfelt appreciation to the following GitHub repositories for pr
 
 https://github.com/DIR-LAB/deep-batch-scheduler
 
-http://github.com/laurentphilippe/greenpower
+
 
 
 

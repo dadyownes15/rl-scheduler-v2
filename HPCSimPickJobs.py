@@ -35,6 +35,7 @@ JOB_FEATURES = int(config.get('algorithm constants', 'JOB_FEATURES'))
 JOB_SEQUENCE_SIZE = int(config.get('algorithm constants', 'JOB_SEQUENCE_SIZE'))
 RUN_FEATURE = int(config.get('algorithm constants', 'RUN_FEATURE'))
 GREEN_FEATURE = int(config.get('algorithm constants', 'GREEN_FEATURE'))
+BASE_LINE_WAIT_CARBON_PENALITY = float(config.get('algorithm constants', 'BASE_LINE_WAIT_CARBON_PENALITY'))
 
 
 action2_num= len(delayTimeList) + delayMaxJobNum + 1
@@ -615,7 +616,8 @@ class HPCEnv(gym.Env):
             job_for_scheduling.scheduled_time - job_for_scheduling.submit_time + job_for_scheduling.run_time)
                          /
                          max(job_for_scheduling.run_time, 10)))
-        return _tmp
+                         
+        return _tmp * (1 - job_for_scheduling.carbon_consideration + BASE_LINE_WAIT_CARBON_PENALITY)
 
     def has_only_one_job(self):
         if len(self.job_queue) == 1:

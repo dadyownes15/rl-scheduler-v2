@@ -235,23 +235,19 @@ class CriticNet(nn.Module):
 
 class PPO():
     def __init__(self, batch_size=10, inputNum_size=[], featureNum_size=[],
-                 device='cpu'):
+                 device='cpu', debug=False):
         super(PPO, self).__init__()
-        self.num_inputs1 = inputNum_size[0]
-        self.num_inputs2 = inputNum_size[1]
-        self.num_inputs3 = inputNum_size[2]
-
-        self.featureNum1 = featureNum_size[0]
-        self.featureNum2 = featureNum_size[1]
-        self.featureNum3 = featureNum_size[2]
-
+        self.inputNum_size = inputNum_size
+        self.featureNum_size = featureNum_size
+        self.actor_net = ActorNet(inputNum_size[0], featureNum_size[0], inputNum_size[1], featureNum_size[1],
+                                  inputNum_size[2], featureNum_size[2])
+        self.critic_net = CriticNet(inputNum_size[0], featureNum_size[0], inputNum_size[1], featureNum_size[1],
+                                    inputNum_size[2], featureNum_size[2])
         self.device = device
-        self.actor_net = ActorNet(
-            self.num_inputs1, self.featureNum1, self.num_inputs2, self.featureNum2, self.num_inputs3,
-            self.featureNum3).to(self.device)
-        self.critic_net = CriticNet(
-            self.num_inputs1, self.featureNum1, self.num_inputs2, self.featureNum2, self.num_inputs3,
-            self.featureNum3).to(self.device)
+        self.debug = debug  # Add debug flag
+        # move models to device
+        self.actor_net.to(device)
+        self.critic_net.to(device)
         self.batch_size = batch_size
         self.gamma = 1
         self.lam = 0.97
@@ -286,8 +282,25 @@ class PPO():
         ac1 = dist_bin1.sample()
         log_prob1 = dist_bin1.log_prob(ac1)
         job_input = state[:, ac1]
+        
+        # Carbon-aware mask modification for action2
+        # Extract carbon_consideration from job_input (feature index 5 in the 7-feature vector)
+        carbon_consideration = job_input[0, 5].item()  # Get carbon consideration value
+        
+        # Create carbon-aware mask2: prevent delay for jobs with low carbon consideration
+        carbon_aware_mask2 = mask2.clone()
+        if carbon_consideration < 0.3:
+            # Force action2 = 0 (immediate scheduling) for low carbon consideration jobs
+            # Set all delay options to 1 (masked out), keep only action2=0 available
+            carbon_aware_mask2[:, 1:] = 1  # Mask out all delay actions (indices 1 and above)
+            # Debug: Print when masking is applied
+            if hasattr(self, 'debug') and self.debug:
+                print(f"DEBUG: Carbon masking applied - carbon_consideration={carbon_consideration:.3f} < 0.3, delay actions masked")
+        elif hasattr(self, 'debug') and self.debug:
+            print(f"DEBUG: No carbon masking - carbon_consideration={carbon_consideration:.3f} >= 0.3, delay actions available")
+        
         with torch.no_grad():
-            probs2 = self.actor_net.getAction2(state, mask2, job_input)
+            probs2 = self.actor_net.getAction2(state, carbon_aware_mask2, job_input)
         dist_bin2 = Categorical(probs=probs2)
         ac2 = dist_bin2.sample()
         log_prob2 = dist_bin2.log_prob(ac2)
@@ -304,7 +317,19 @@ class PPO():
         return log_prob1, entropy1
 
     def act_exc(self, state, mask2, job_input, ac2):
-        probs2 = self.actor_net.getAction2(state, mask2, job_input)
+        # Carbon-aware mask modification for action2
+        # Extract carbon_consideration from job_input (feature index 5 in the 7-feature vector)
+        carbon_consideration = job_input[:, 5]  # Get carbon consideration value for batch
+        
+        # Create carbon-aware mask2: prevent delay for jobs with low carbon consideration
+        carbon_aware_mask2 = mask2.clone()
+        # Apply mask for each sample in the batch where carbon_consideration < 0.3
+        low_carbon_mask = carbon_consideration < 0.3
+        if low_carbon_mask.any():
+            # For jobs with low carbon consideration, mask out all delay actions
+            carbon_aware_mask2[low_carbon_mask, 1:] = 1  # Mask out all delay actions (indices 1 and above)
+        
+        probs2 = self.actor_net.getAction2(state, carbon_aware_mask2, job_input)
         dist_bin2 = Categorical(probs=probs2)
         log_prob2 = dist_bin2.log_prob(ac2)
         entropy2 = dist_bin2.entropy()
@@ -476,7 +501,19 @@ class PPO():
             dist_bin1 = Categorical(probs=probs1)
             ac1 = dist_bin1.sample()
             job_input = state[:, ac1]
-            probs2 = self.actor_net.getAction2(state, mask2, job_input)
+            
+            # Carbon-aware mask modification for action2
+            # Extract carbon_consideration from job_input (feature index 5 in the 7-feature vector)
+            carbon_consideration = job_input[0, 5].item()  # Get carbon consideration value
+            
+            # Create carbon-aware mask2: prevent delay for jobs with low carbon consideration
+            carbon_aware_mask2 = mask2.clone()
+            if carbon_consideration < 0.3:
+                # Force action2 = 0 (immediate scheduling) for low carbon consideration jobs
+                # Set all delay options to 1 (masked out), keep only action2=0 available
+                carbon_aware_mask2[:, 1:] = 1  # Mask out all delay actions (indices 1 and above)
+            
+            probs2 = self.actor_net.getAction2(state, carbon_aware_mask2, job_input)
             dist_bin2 = Categorical(probs=probs2)
             ac2 = dist_bin2.sample()
 
@@ -771,7 +808,8 @@ def train(workload, backfill, debug=False, experiment_name="", description=""):
         batch_size      = 256,
         inputNum_size   = inputNum_size,
         featureNum_size = featureNum_size,
-        device          = device
+        device          = device,
+        debug           = debug
     )
     
     # ------------------------------------------------------------------
@@ -869,11 +907,14 @@ def train(workload, backfill, debug=False, experiment_name="", description=""):
             green_reward += greenRwd   # energy-aware part
             wait_reward  += r          # waiting-time part
             epoch_reward += eta * r + greenRwd
+
+            
             
             # ----------------------------------------------------------
             # 5-d. If episode ends → push terminal reward, maybe finish epoch
             # ----------------------------------------------------------
             if d:
+                assert(epoch_Reward == 0)
                 # Print aggregated trajectory summary for debugging
                 if debug and t < 3:
                     avg_valid_jobs = sum(trajectory_stats["valid_jobs"]) / len(trajectory_stats["valid_jobs"]) if trajectory_stats["valid_jobs"] else 0

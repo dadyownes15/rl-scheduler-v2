@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+""" #!/usr/bin/env python3
 """
 MARL_r.py - Modified MARL with flexible reward interface and score tracking
 """
@@ -1018,4 +1018,4 @@ if __name__ == "__main__":
     parser.add_argument('--name', type=str, required=True, help='Experiment name (e.g., ED12)')
     parser.add_argument('--description', type=str, default='', help='Description of the experiment')
     args = parser.parse_args()
-    train(args.workload, args.backfill, args.debug, args.name, args.description)
+    train(args.workload, args.backfill, args.debug, args.name, args.description) """
