@@ -2,6 +2,10 @@
 """
 Enhanced validation script for MARL experiments with comprehensive job tracking.
 Fixes critical issues: job completion tracking, carbon emissions per job, and proper data logging.
+
+RECENT FIX (2025-01-xx): Added ensure_job_record() to capture ALL jobs in episode batch,
+including those scheduled automatically via backfilling. This ensures regression analysis
+always uses the full job_sequence_size × validation_episodes dataset for accurate scoring.
 """
 
 import pandas as pd
@@ -113,27 +117,54 @@ def load_marl_model(experiment_path, workload_arg=None, epoch=None):
 class EnhancedJobTracker:
     """Enhanced job tracker with comprehensive completion and carbon tracking"""
     
-    def __init__(self):
+    def __init__(self, random_year_offset=True, seed=None):
         self.jobs_data = []
         self.episode_data = []
         self.job_id_to_index = {}  # Map job_id to index for faster lookup
         self.carbon_window_data = []  # Store viewable window data for each job
         
+        # Set simulation start datetime for conversion with random offset
+        # Using year 2023 as base year to align with carbon intensity data
+        if random_year_offset:
+            if seed is not None:
+                np.random.seed(seed)
+            
+            # Random offset within the year (0-364 days to avoid year boundary issues)
+            random_day_offset = np.random.randint(0, 365)
+            random_hour_offset = np.random.randint(0, 24)
+            
+            self.simulation_start_datetime = datetime(2023, 1, 1, 0, 0, 0) + pd.Timedelta(
+                days=random_day_offset, hours=random_hour_offset
+            )
+            print(f"Random carbon intensity start date: {self.simulation_start_datetime.strftime('%Y-%m-%d %H:%M')}")
+        else:
+            self.simulation_start_datetime = datetime(2023, 1, 1, 0, 0, 0)
+            
+        self.simulation_start_time = None  # Will be set when first job is recorded
+        
     def record_job_submission(self, job, queue_length, current_time, env=None):
         """Record job when it's submitted to the queue"""
+        # Convert simulation time to actual datetime
+        submit_datetime = self._simulation_time_to_datetime(job.submit_time)
+        submission_datetime = self._simulation_time_to_datetime(current_time)
+        
         job_info = {
             'job_id': getattr(job, 'job_id', 'unknown'),
-            'submit_time': job.submit_time,
+            'submit_time': job.submit_time,  # Keep original simulation time
+            'submit_datetime': submit_datetime.isoformat() if submit_datetime else None,  # Add actual datetime
             'request_time': job.request_time,
             'request_processors': job.request_number_of_processors,
             'carbon_consideration': getattr(job, 'carbon_consideration', -1),
             'queue_length_at_submission': queue_length,
-            'submission_timestamp': current_time,
+            'submission_timestamp': current_time,  # Keep original simulation time
+            'submission_datetime': submission_datetime.isoformat() if submission_datetime else None,  # Add actual datetime
             'user_id': getattr(job, 'user_id', -1),
             'power': getattr(job, 'power', 0),
             # Will be filled when scheduled/completed
             'scheduled_time': None,
+            'scheduled_datetime': None,
             'completion_time': None,
+            'completion_datetime': None,
             'wait_time': None,
             'actual_runtime': None,
             'action1': None,
@@ -148,6 +179,24 @@ class EnhancedJobTracker:
         self.job_id_to_index[job.job_id] = job_index
         
         return job_index
+    
+    def _simulation_time_to_datetime(self, simulation_time):
+        """Convert simulation time (seconds) to actual datetime"""
+        try:
+            if self.simulation_start_time is None:
+                # First job sets the simulation start reference
+                self.simulation_start_time = simulation_time
+            
+            # Calculate offset from simulation start
+            offset_seconds = simulation_time - self.simulation_start_time
+            
+            # Add offset to our base datetime
+            actual_datetime = self.simulation_start_datetime + pd.Timedelta(seconds=offset_seconds)
+            
+            return actual_datetime
+        except Exception as e:
+            print(f"Warning: Failed to convert simulation time {simulation_time} to datetime: {e}")
+            return None
     
     def record_agent_decision(self, env, selected_job, action1, action2):
         """
@@ -245,6 +294,9 @@ class EnhancedJobTracker:
             a1_val = action1.item() if hasattr(action1, 'item') else int(action1)
             a2_val = action2.item() if hasattr(action2, 'item') else int(action2)
             
+            # Convert scheduled time to datetime
+            scheduled_datetime = self._simulation_time_to_datetime(scheduled_time)
+            
             # Calculate individual job carbon emissions
             start_time = scheduled_time
             end_time = start_time + job.request_time
@@ -266,6 +318,7 @@ class EnhancedJobTracker:
             
             self.jobs_data[job_index].update({
                 'scheduled_time': scheduled_time,
+                'scheduled_datetime': scheduled_datetime.isoformat() if scheduled_datetime else None,
                 'wait_time': scheduled_time - self.jobs_data[job_index]['submit_time'],
                 'action1': a1_val,
                 'action2': a2_val,
@@ -278,8 +331,13 @@ class EnhancedJobTracker:
         """Update job info when it completes - now uses job_id for direct lookup"""
         if job_id in self.job_id_to_index:
             job_index = self.job_id_to_index[job_id]
+            
+            # Convert completion time to datetime
+            completion_datetime = self._simulation_time_to_datetime(completion_time)
+            
             self.jobs_data[job_index].update({
                 'completion_time': completion_time,
+                'completion_datetime': completion_datetime.isoformat() if completion_datetime else None,
                 'actual_runtime': actual_runtime,
                 'completed': True
             })
@@ -311,6 +369,91 @@ class EnhancedJobTracker:
                     actual_runtime = job.request_time
                     self.update_job_completion(job.job_id, completion_time, actual_runtime)
     
+    def ensure_job_record(self, job, env, scheduled_only=True):
+        """
+        Guarantee that every job in the episode appears in self.jobs_data.
+        If the job is already present do nothing, otherwise create a minimal
+        record (scheduled=True/False, completed=True/False, timings, etc.).
+        
+        This captures jobs that were auto-scheduled via backfilling and missed
+        by the normal agent-decision tracking.
+        
+        Args:
+            job: Job object from the workload
+            env: Environment instance for context
+            scheduled_only: If True, only record jobs that were actually scheduled
+        """
+        # Check if job is already tracked
+        if job.job_id in self.job_id_to_index:
+            return  # Already recorded, nothing to do
+        
+        # Check if job was scheduled
+        was_scheduled = hasattr(job, 'scheduled_time') and job.scheduled_time != -1
+        
+        # Skip unscheduled jobs if scheduled_only is True
+        if scheduled_only and not was_scheduled:
+            return
+            
+        # Check if job was completed
+        was_completed = False
+        if was_scheduled:
+            completion_time = job.scheduled_time + job.request_time
+            was_completed = (env.current_timestamp >= completion_time and 
+                           job not in env.running_jobs)
+        
+        # Calculate carbon emissions if scheduled
+        carbon_emissions = None
+        carbon_reward = None
+        if was_scheduled and hasattr(self, 'carbon_intensity'):
+            try:
+                carbon_emissions = self.carbon_intensity.getCarbonEmissions(
+                    job.power, job.scheduled_time, job.scheduled_time + job.request_time
+                )
+                # Calculate individual job carbon reward
+                carbon_reward = self.carbon_intensity.getCarbonAwareReward([job])
+            except Exception:
+                carbon_emissions = 0.0
+                carbon_reward = 0.0
+        
+        # Convert times to datetime
+        submit_datetime = self._simulation_time_to_datetime(job.submit_time)
+        submission_datetime = self._simulation_time_to_datetime(job.submit_time)
+        scheduled_datetime = self._simulation_time_to_datetime(job.scheduled_time) if was_scheduled else None
+        completion_datetime = self._simulation_time_to_datetime(completion_time) if was_completed else None
+        
+        # Create comprehensive job record
+        job_info = {
+            'job_id': getattr(job, 'job_id', 'unknown'),
+            'submit_time': job.submit_time,
+            'submit_datetime': submit_datetime.isoformat() if submit_datetime else None,
+            'request_time': job.request_time,
+            'request_processors': job.request_number_of_processors,
+            'carbon_consideration': getattr(job, 'carbon_consideration', -1),
+            'queue_length_at_submission': 0,  # Unknown for backfilled jobs
+            'submission_timestamp': job.submit_time,  # Best guess
+            'submission_datetime': submission_datetime.isoformat() if submission_datetime else None,
+            'user_id': getattr(job, 'user_id', -1),
+            'power': getattr(job, 'power', 0),
+            # Scheduling info
+            'scheduled_time': job.scheduled_time if was_scheduled else None,
+            'scheduled_datetime': scheduled_datetime.isoformat() if scheduled_datetime else None,
+            'completion_time': completion_time if was_completed else None,
+            'completion_datetime': completion_datetime.isoformat() if completion_datetime else None,
+            'wait_time': (job.scheduled_time - job.submit_time) if was_scheduled else None,
+            'actual_runtime': job.request_time if was_completed else None,
+            'action1': None,  # Unknown for auto-scheduled jobs
+            'action2': None,  # Unknown for auto-scheduled jobs
+            'scheduled': was_scheduled,
+            'completed': was_completed,
+            'carbon_emissions': carbon_emissions,
+            'carbon_reward': carbon_reward
+        }
+        
+        # Add to tracking
+        job_index = len(self.jobs_data)
+        self.jobs_data.append(job_info)
+        self.job_id_to_index[job.job_id] = job_index
+
     def record_episode_summary(self, episode_num, total_reward, green_reward, jobs_completed, makespan):
         """Record episode-level summary"""
         completed_jobs = [j for j in self.jobs_data if j['completed']]
@@ -425,11 +568,29 @@ def run_enhanced_marl_validation(model, env, tracker, episode_num):
     # Finalize remaining jobs at episode end
     tracker.finalize_remaining_jobs(env)
     
+    # CRITICAL: Ensure ALL jobs in the episode batch are recorded
+    # This captures jobs scheduled via backfilling that the agent never directly selected
+    agent_decisions_count = len([j for j in tracker.jobs_data if j['action1'] is not None])
+    
+    # Walk through the entire episode batch
+    for job_idx in range(env.start, env.last_job_in_batch):
+        if job_idx < len(env.loads.all_jobs):
+            job = env.loads.all_jobs[job_idx]
+            tracker.ensure_job_record(job, env, scheduled_only=True)
+    
+    # Calculate final counts
+    total_scheduled_count = len([j for j in tracker.jobs_data if j['scheduled']])
+    total_jobs_in_batch = env.last_job_in_batch - env.start
+    
     # Record episode summary
     makespan = env.current_timestamp - env.start_timestamp if hasattr(env, 'start_timestamp') else 0
     tracker.record_episode_summary(episode_num, total_reward, green_reward, jobs_completed, makespan)
     
-    print(f"  Episode {episode_num} completed: steps={step_count}, reward={total_reward:.2f}, green={green_reward:.2f}")
+    print(f"  Episode {episode_num} completed:")
+    print(f"    Agent decisions: {agent_decisions_count}")
+    print(f"    Total scheduled jobs after post-fill: {total_scheduled_count}")
+    print(f"    Jobs in batch (target): {total_jobs_in_batch}")
+    print(f"    Steps: {step_count}, Reward: {total_reward:.2f}, Green: {green_reward:.2f}")
     
     return total_reward, green_reward, jobs_completed
 
@@ -577,9 +738,11 @@ def main():
     parser.add_argument('--workload', required=True, help='Workload name (e.g., lublin_256_carbon_float) or file path (e.g., ./data/lublin_256_carbon_float.swf)')
     parser.add_argument('--epoch', type=int, help='Epoch number to load weights from (if not specified, loads from final/)')
     parser.add_argument('--episodes', type=int, default=5, help='Number of validation episodes')
+    parser.add_argument('--jobs-per-episode', type=int, default=1024, help='Number of jobs per validation episode')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     parser.add_argument('--backfill', type=int, default=0, help='Backfill strategy (0=FCFS, 1=backfill enabled)')
     parser.add_argument('--debug', action='store_true', help='Enable debug output')
+    parser.add_argument('--no-random-offset', action='store_true', help='Disable random carbon intensity offset (all episodes start from 2023-01-01)')
     
     args = parser.parse_args()
     
@@ -590,9 +753,11 @@ def main():
     print(f"Workload: {args.workload}")
     print(f"Epoch: {args.epoch if args.epoch is not None else 'final'}")
     print(f"Episodes: {args.episodes}")
+    print(f"Jobs per episode: {args.jobs_per_episode}")
     print(f"Seed: {args.seed}")
     print(f"Backfill: {args.backfill}")
     print(f"Debug: {args.debug}")
+    print(f"Random carbon offset: {not args.no_random_offset}")
     print()
     
     # Set seeds for reproducibility
@@ -620,21 +785,44 @@ def main():
     env = HPCEnv(backfill=args.backfill, debug=args.debug)
     env.my_init(workload_file)
     env.seed(args.seed)
+    
+    # Override job sequence size for validation (don't modify config.ini)
+    # The environment uses num_job_in_batch to control episode size
+    original_job_sequence_size = env.num_job_in_batch
+    print(f"Overriding job sequence size from {original_job_sequence_size} to {args.jobs_per_episode} for validation")
+    
+    # We need to override this during each episode reset, not here
+    # Store the desired size for use in run_enhanced_marl_validation
+    env._validation_job_sequence_size = args.jobs_per_episode
+    
     print("✓ Environment initialized")
     
-    # Initialize enhanced tracker
-    tracker = EnhancedJobTracker()
-    
-    # Run validation episodes
+    # Run validation episodes with random carbon intensity offsets
     print(f"\nRunning {args.episodes} validation episodes...")
     episode_results = []
+    all_episode_trackers = []  # Collect all trackers to aggregate data later
     
     for episode in range(args.episodes):
         print(f"\nEpisode {episode + 1}/{args.episodes}")
+        
+        # Create a new tracker for each episode with different random offset
+        # Use episode number as additional seed variation for reproducibility
+        episode_seed = args.seed + episode if args.seed is not None else None
+        use_random_offset = not args.no_random_offset
+        episode_tracker = EnhancedJobTracker(random_year_offset=use_random_offset, seed=episode_seed)
+        all_episode_trackers.append(episode_tracker)
+        
         env.reset()
         
+        # Override job sequence size for this episode
+        if hasattr(env, '_validation_job_sequence_size'):
+            original_batch_size = env.num_job_in_batch
+            env.num_job_in_batch = env._validation_job_sequence_size
+            env.last_job_in_batch = env.start + env.num_job_in_batch
+            print(f"  Overrode episode job count from {original_batch_size} to {env.num_job_in_batch}")
+        
         total_reward, green_reward, jobs_completed = run_enhanced_marl_validation(
-            model, env, tracker, episode + 1
+            model, env, episode_tracker, episode + 1
         )
         
         episode_results.append({
@@ -644,6 +832,18 @@ def main():
             'jobs_completed': jobs_completed
         })
     
+    # Aggregate all episode data into a single tracker for saving
+    print(f"\nAggregating data from {len(all_episode_trackers)} episodes...")
+    combined_tracker = EnhancedJobTracker(random_year_offset=False)  # No random offset for combined tracker
+    
+    # Combine all job data
+    for episode_tracker in all_episode_trackers:
+        combined_tracker.jobs_data.extend(episode_tracker.jobs_data)
+        combined_tracker.episode_data.extend(episode_tracker.episode_data)
+        combined_tracker.carbon_window_data.extend(episode_tracker.carbon_window_data)
+    
+    print(f"Combined tracker has {len(combined_tracker.jobs_data)} jobs from all episodes")
+    
     # Save results
     print(f"\nSaving enhanced validation results...")
     # Pass the detected experiment path from model loading
@@ -651,7 +851,7 @@ def main():
         experiment_path = model._experiment_path
     else:
         experiment_path = args.experiment
-    save_enhanced_validation_results(tracker, experiment_path, workload_file, args.episodes, args.epoch)
+    save_enhanced_validation_results(combined_tracker, experiment_path, workload_file, args.episodes, args.epoch)
     
     # Print summary
     print(f"\n" + "=" * 80)

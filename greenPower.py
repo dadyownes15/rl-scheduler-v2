@@ -10,6 +10,9 @@ config.read('configFile/config.ini')
 USE_DYNAMIC_WINDOW = config.getboolean('carbon setting', 'USE_DYNAMIC_WINDOW', fallback=True)  # If True, use dynamic window from scheduled time to last job end
                           # If False, use fixed 24-hour window from scheduled time
 
+# Carbon reward function configuration
+CARBON_REWARD_FUNCTION = config.get('carbon setting', 'carbon_reward_function', fallback='emission_ratio')
+
 # Maximum carbon intensity for normalization (gCO2eq/kWh)
 # Based on the historical maximum from DK data: ~467.25, rounded up to 500 for safety
 MAX_CARBON_INTENSITY = float(config.get('algorithm constants', 'MAX_CARBON_INTENSITY')) 
@@ -91,7 +94,7 @@ class carbon_intensity():
             
             # Handle wrap-around for year-long data with start offset
             hour_index = (i + self.start_offset) % len(self.carbonIntensityList)
-            carbonIntensity = self.carbonIntensityList[hour_index]  # gCO2eq/kWh
+            carbonIntensity = self.carbonIntensityList[hour_index]
             
             # Convert power from watts to kW and time from seconds to hours
             energyKWh = (power / 1000.0) * (lastTime / 3600.0)
@@ -306,6 +309,28 @@ class carbon_intensity():
     def getCarbonAwareReward(self, scheduledJobs):
         """
         Calculate carbon-aware reward for post-scheduling evaluation.
+        Dispatches to different reward calculation methods based on configuration.
+        
+        Args:
+            scheduledJobs: list of jobs with scheduled_time, submit_time, request_time, power, carbon_consideration
+        
+        Returns:
+            Carbon-aware reward (negative value, higher magnitude = worse)
+        """
+        if CARBON_REWARD_FUNCTION == 'emission_ratio':
+            return self._getCarbonAwareReward_EmissionRatio(scheduledJobs)
+        elif CARBON_REWARD_FUNCTION == 'co2_direct':
+            return self._getCarbonAwareReward_CO2Direct(scheduledJobs)
+        elif CARBON_REWARD_FUNCTION == 'fcfs_normalized':
+            return self._getCarbonAwareReward_FCFSNormalized(scheduledJobs)
+        else:
+            # Default to emission_ratio if unknown function specified
+            print(f"Warning: Unknown carbon reward function '{CARBON_REWARD_FUNCTION}', using 'emission_ratio'")
+            return self._getCarbonAwareReward_EmissionRatio(scheduledJobs)
+
+    def _getCarbonAwareReward_EmissionRatio(self, scheduledJobs):
+        """
+        Original emission ratio method: Compare actual vs worst-case emissions.
         Reward is based on the average of carbon-consideration-weighted emission ratios.
         Higher carbon consideration makes the job's performance impact the reward more.
         
@@ -381,6 +406,134 @@ class carbon_intensity():
         
         # Return negative reward (penalty) - higher carbon consideration jobs with worse ratios = worse reward
         return -avg_weighted_ratio
+
+    def _getCarbonAwareReward_CO2Direct(self, scheduledJobs):
+        """
+        Direct CO2 method: Simple CO2 emissions multiplied by carbon consideration.
+        Calculates actual CO2 emissions for each job and multiplies by its carbon consideration.
+        
+        Args:
+            scheduledJobs: list of jobs with scheduled_time, submit_time, request_time, power, carbon_consideration
+        
+        Returns:
+            Carbon-aware reward (negative value, higher magnitude = worse)
+        """
+        if not scheduledJobs:
+            return 0.0
+        
+        # Filter out unscheduled jobs
+        valid_jobs = [job for job in scheduledJobs 
+                     if hasattr(job, 'scheduled_time') and job.scheduled_time != -1]
+        
+        if not valid_jobs:
+            return 0.0
+        
+        total_weighted_co2 = 0.0
+        
+        for job in valid_jobs:
+            start_time = job.scheduled_time
+            end_time = start_time + job.request_time
+            power = job.power
+            carbon_consideration = getattr(job, 'carbon_consideration', 0)
+            
+            # Calculate actual CO2 emissions for this job
+            co2_emissions = self.getCarbonEmissions(power, start_time, end_time)
+            
+            # Multiply by carbon consideration
+            weighted_co2 = co2_emissions * carbon_consideration
+            total_weighted_co2 += weighted_co2
+        
+        # Return negative (penalty) and scale to reasonable range (gCO2 to kgCO2)
+        return -total_weighted_co2 / 100000.0
+
+    def _getCarbonAwareReward_FCFSNormalized(self, scheduledJobs):
+        """
+        FCFS-normalized reward function that calculates percentage change in emissions 
+        relative to FCFS baseline, weighted by carbon consideration.
+        
+        Equivalent to: -Σ(carbon_consideration * Δem_pct_per_job) / Σ(carbon_consideration)
+        where Δem_pct_per_job = (em_cur_job - em_fcfs_job) / (em_fcfs_job + 1e-6)
+        
+        Args:
+            scheduledJobs: list of jobs with scheduled_time, submit_time, request_time, power, carbon_consideration
+        
+        Returns:
+            FCFS-normalized carbon reward weighted by carbon consideration (higher = better, positive = improvement over FCFS)
+        """
+        if not scheduledJobs:
+            return 0.0
+        
+        # Filter out unscheduled jobs
+        valid_jobs = [job for job in scheduledJobs 
+                     if hasattr(job, 'scheduled_time') and job.scheduled_time != -1]
+        
+        if not valid_jobs:
+            return 0.0
+        
+        # Calculate FCFS baseline schedule for comparison
+        fcfs_schedule = self._simulate_fcfs_schedule(valid_jobs)
+        
+        total_weighted_delta = 0.0
+        total_carbon_consideration = 0.0
+        
+        for job in valid_jobs:
+            carbon_consideration = getattr(job, 'carbon_consideration', 0)
+            
+            # Skip jobs with no carbon consideration
+            if carbon_consideration == 0:
+                continue
+            
+            # Current schedule emissions for this job
+            em_cur_job = self.getCarbonEmissions(job.power, job.scheduled_time, 
+                                               job.scheduled_time + job.request_time)
+            
+            # FCFS schedule emissions for this job
+            fcfs_start_time = fcfs_schedule.get(job.job_id, job.scheduled_time)
+            em_fcfs_job = self.getCarbonEmissions(job.power, fcfs_start_time, 
+                                                fcfs_start_time + job.request_time)
+            
+            # Calculate percentage change for this job
+            Δem_pct_job = (em_cur_job - em_fcfs_job) / (em_fcfs_job + 1e-6)
+            
+            # Weight by carbon consideration
+            weighted_delta = carbon_consideration * Δem_pct_job
+            total_weighted_delta += weighted_delta
+            total_carbon_consideration += carbon_consideration
+        
+        if total_carbon_consideration == 0:
+            return 0.0
+        
+        # Calculate weighted average percentage change
+        avg_weighted_delta = total_weighted_delta / total_carbon_consideration
+        
+        # Return negative of percentage change (higher = better, positive = improvement over FCFS)
+        return -avg_weighted_delta
+    
+    def _simulate_fcfs_schedule(self, jobs):
+        """
+        Simulate FCFS scheduling to get start times for each job.
+        
+        Args:
+            jobs: list of jobs to schedule
+            
+        Returns:
+            Dictionary mapping job_id to FCFS start_time
+        """
+        # Sort jobs by submit time (FCFS order)
+        fcfs_jobs = sorted(jobs, key=lambda j: j.submit_time)
+        
+        current_time = min(job.submit_time for job in fcfs_jobs) if fcfs_jobs else 0
+        fcfs_schedule = {}
+        
+        for job in fcfs_jobs:
+            # Job starts when it arrives or when current time allows
+            fcfs_start_time = max(current_time, job.submit_time)
+            fcfs_schedule[job.job_id] = fcfs_start_time
+            
+            # Update current time (assuming infinite resources for simplicity)
+            current_time = fcfs_start_time + job.request_time
+        
+        return fcfs_schedule
 
     def getCarbonMetrics(self, scheduledJobs):
         """

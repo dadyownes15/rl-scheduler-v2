@@ -284,8 +284,21 @@ class PPO():
         job_input = state[:, ac1]
         
         # Carbon-aware mask modification for action2
-        # Extract carbon_consideration from job_input (feature index 5 in the 7-feature vector)
-        carbon_consideration = job_input[0, 5].item()  # Get carbon consideration value
+        # Extract carbon_consideration from job_input
+        # The job_input tensor should have the 7 job features, but the indexing might be tricky
+        try:
+            # If job_input has shape [1, 1, 7], we need job_input[0, 0, 5]
+            # If job_input has shape [1, 7], we need job_input[0, 5]
+            if len(job_input.shape) == 3 and job_input.shape[2] >= 6:
+                carbon_consideration = job_input[0, 0, 5].item()  # 3D tensor case
+            elif len(job_input.shape) == 2 and job_input.shape[1] >= 6:
+                carbon_consideration = job_input[0, 5].item()  # 2D tensor case
+            else:
+                # Fallback: if we can't access the carbon consideration, assume 0.0
+                carbon_consideration = 0.0
+        except (IndexError, RuntimeError) as e:
+            # Fallback: if indexing fails for any reason, assume no carbon consideration  
+            carbon_consideration = 0.0
         
         # Create carbon-aware mask2: prevent delay for jobs with low carbon consideration
         carbon_aware_mask2 = mask2.clone()
@@ -293,11 +306,6 @@ class PPO():
             # Force action2 = 0 (immediate scheduling) for low carbon consideration jobs
             # Set all delay options to 1 (masked out), keep only action2=0 available
             carbon_aware_mask2[:, 1:] = 1  # Mask out all delay actions (indices 1 and above)
-            # Debug: Print when masking is applied
-            if hasattr(self, 'debug') and self.debug:
-                print(f"DEBUG: Carbon masking applied - carbon_consideration={carbon_consideration:.3f} < 0.3, delay actions masked")
-        elif hasattr(self, 'debug') and self.debug:
-            print(f"DEBUG: No carbon masking - carbon_consideration={carbon_consideration:.3f} >= 0.3, delay actions available")
         
         with torch.no_grad():
             probs2 = self.actor_net.getAction2(state, carbon_aware_mask2, job_input)
@@ -318,8 +326,19 @@ class PPO():
 
     def act_exc(self, state, mask2, job_input, ac2):
         # Carbon-aware mask modification for action2
-        # Extract carbon_consideration from job_input (feature index 5 in the 7-feature vector)
-        carbon_consideration = job_input[:, 5]  # Get carbon consideration value for batch
+        # Extract carbon_consideration from job_input
+        try:
+            # Handle different tensor shapes for batch processing
+            if len(job_input.shape) == 3 and job_input.shape[2] >= 6:
+                carbon_consideration = job_input[:, 0, 5]  # 3D tensor case, get batch dimension
+            elif len(job_input.shape) == 2 and job_input.shape[1] >= 6:
+                carbon_consideration = job_input[:, 5]  # 2D tensor case, get batch dimension
+            else:
+                # Fallback: if we can't access the carbon consideration, assume 0.0 for all in batch
+                carbon_consideration = torch.zeros(job_input.shape[0], device=job_input.device)
+        except (IndexError, RuntimeError):
+            # Fallback: if indexing fails for any reason, assume no carbon consideration  
+            carbon_consideration = torch.zeros(job_input.shape[0], device=job_input.device)
         
         # Create carbon-aware mask2: prevent delay for jobs with low carbon consideration
         carbon_aware_mask2 = mask2.clone()
@@ -427,7 +446,10 @@ class PPO():
 
         total_loss = policy_loss - self.entropy_coefficient * entropy_loss
 
-        return total_loss, policy_loss, entropy_loss
+        # KL divergence approximation KL(old||new) = mean(old_log - new_log)
+        kl_mean = torch.mean(log1 - log2).detach()
+
+        return total_loss, policy_loss, entropy_loss, kl_mean
 
     def train(self):
         states = torch.cat(self.buffer.states, dim=0)
@@ -440,7 +462,30 @@ class PPO():
         job_inputs = torch.cat(self.buffer.job_inputs, dim=0)
         returns = torch.tensor(self.buffer.Returns)
         advantages = torch.tensor(self.buffer.advantages)
+        
+        # Store pre-normalized advantages for analysis
+        advantages_raw = advantages.clone()
         advantages = self.normalize(advantages)
+
+        # Initialize metrics tracking
+        metrics = {
+            # Policy optimization metrics
+            'policy_loss_clipped': [],
+            'policy_loss_unclipped': [],
+            'entropy': [],
+            'approx_kl': [],
+            'clip_fraction': [],
+            
+            # Critic metrics
+            'value_loss': [],
+            'explained_variance': [],
+            
+            # Advantage metrics
+            'adv_mean': advantages_raw.mean().item(),
+            'adv_std': advantages_raw.std().item(),
+            'adv_normalized_mean': advantages.mean().item(),
+            'adv_normalized_std': advantages.std().item(),
+        }
 
         for i in range(self.ppo_update_time):
             for index in BatchSampler(SubsetRandomSampler(range(len(self.buffer.states))), self.batch_size, False):
@@ -456,24 +501,67 @@ class PPO():
                 sampled_advantages = torch.index_select(advantages, dim=0, index=index_tensor).to(self.device)
                 sampled_job_inputs = torch.index_select(job_inputs, dim=0, index=index_tensor).to(self.device)
 
+                # Actor update with detailed metrics
                 self.actor_optimizer.zero_grad()
-                action_loss, polic_loss, entropy_loss = self.compute_actor_loss(sampled_states, sampled_masks1,
+                action_loss, policy_loss, entropy_loss, kl_mean = self.compute_actor_loss(sampled_states, sampled_masks1,
                                                                                 sampled_masks2,
                                                                                 sampled_actions1, sampled_actions2,
                                                                                 sampled_advantages,
                                                                                 sampled_log_probs1, sampled_log_probs2,
                                                                                 sampled_job_inputs)
+                
+                # Calculate clipping fraction for this batch
+                with torch.no_grad():
+                    log_probs1_new, _ = self.act_job(sampled_states, sampled_masks1, sampled_actions1)
+                    log_probs2_new, _ = self.act_exc(sampled_states, sampled_masks2, sampled_job_inputs, sampled_actions2)
+                    log_old = sampled_log_probs1 + sampled_log_probs2
+                    log_new = log_probs1_new + log_probs2_new
+                    ratio = torch.exp(log_new - log_old)
+                    clipped_ratio = torch.clamp(ratio, 1 - self.clip_param, 1 + self.clip_param)
+                    clip_fraction = torch.mean((ratio != clipped_ratio).float()).item()
+                
                 action_loss.backward()
-                nn.utils.clip_grad_norm_(
-                    self.actor_net.parameters(), self.max_grad_norm)
+                nn.utils.clip_grad_norm_(self.actor_net.parameters(), self.max_grad_norm)
                 self.actor_optimizer.step()
 
+                # Critic update with metrics
                 self.critic_net_optimizer.zero_grad()
                 value_loss = self.compute_value_loss(sampled_states, sampled_returns)
+                
+                # Calculate explained variance
+                with torch.no_grad():
+                    state_values = self.critic_net(sampled_states).squeeze(dim=1)
+                    y_pred = state_values
+                    y_true = sampled_returns
+                    var_y = torch.var(y_true)
+                    explained_var = 1 - torch.var(y_true - y_pred) / (var_y + 1e-8)
+                    explained_variance = explained_var.item()
+                
                 value_loss.backward()
-                nn.utils.clip_grad_norm_(
-                    self.critic_net.parameters(), self.max_grad_norm)
+                nn.utils.clip_grad_norm_(self.critic_net.parameters(), self.max_grad_norm)
                 self.critic_net_optimizer.step()
+
+                # Store metrics
+                metrics['policy_loss_clipped'].append(action_loss.item())
+                metrics['policy_loss_unclipped'].append(policy_loss.item())
+                metrics['entropy'].append(entropy_loss.item())
+                metrics['approx_kl'].append(kl_mean.item())
+                metrics['clip_fraction'].append(clip_fraction)
+                metrics['value_loss'].append(value_loss.item())
+                metrics['explained_variance'].append(explained_variance)
+
+        # Aggregate metrics
+        aggregated_metrics = {}
+        for key, values in metrics.items():
+            if isinstance(values, list) and len(values) > 0:
+                aggregated_metrics[key] = sum(values) / len(values)
+            else:
+                aggregated_metrics[key] = values
+
+        if self.debug and len(metrics['approx_kl']) > 0:
+            print(f"    ↳ Avg KL divergence: {aggregated_metrics['approx_kl']:.6f}")
+            
+        return aggregated_metrics
 
     def save_using_model_name(self, model_name_path):
         if not os.path.exists(model_name_path):
@@ -503,8 +591,19 @@ class PPO():
             job_input = state[:, ac1]
             
             # Carbon-aware mask modification for action2
-            # Extract carbon_consideration from job_input (feature index 5 in the 7-feature vector)
-            carbon_consideration = job_input[0, 5].item()  # Get carbon consideration value
+            # Extract carbon_consideration from job_input
+            try:
+                # Handle different tensor shapes - 3D or 2D
+                if len(job_input.shape) == 3 and job_input.shape[2] >= 6:
+                    carbon_consideration = job_input[0, 0, 5].item()  # 3D tensor case
+                elif len(job_input.shape) == 2 and job_input.shape[1] >= 6:
+                    carbon_consideration = job_input[0, 5].item()  # 2D tensor case
+                else:
+                    # Fallback: if we can't access the carbon consideration, assume 0.0
+                    carbon_consideration = 0.0
+            except (IndexError, RuntimeError):
+                # Fallback: if indexing fails for any reason, assume no carbon consideration  
+                carbon_consideration = 0.0
             
             # Create carbon-aware mask2: prevent delay for jobs with low carbon consideration
             carbon_aware_mask2 = mask2.clone()
@@ -563,16 +662,39 @@ def calculate_epoch_score(ppo_model, env, experiment_dir, epoch, workload, debug
         # Initialize enhanced tracker for validation
         tracker = EnhancedJobTracker()
         
-        # Run a single validation episode to collect data
-        env.reset()
-        total_reward, green_reward, jobs_completed = run_enhanced_marl_validation(
-            wrapped_model, env, tracker, 1
-        )
+        # Run multiple validation episodes to collect more data for better analysis
+        # Read validation episodes from config
+        config = configparser.ConfigParser()
+        config.read('configFile/config.ini')
+        total_episodes = int(config.get('training parameters', 'validation_episodes', fallback=5))
+        episode_results = []
+        
+        if debug:
+            print(f"  Running {total_episodes} validation episodes for score calculation...")
+        
+        for episode in range(total_episodes):
+            env.reset()
+            total_reward, green_reward, jobs_completed = run_enhanced_marl_validation(
+                wrapped_model, env, tracker, episode + 1
+            )
+            episode_results.append({
+                'episode': episode + 1,
+                'total_reward': total_reward,
+                'green_reward': green_reward,
+                'jobs_completed': jobs_completed
+            })
+            
+            if debug:
+                print(f"    Episode {episode + 1}: {len([j for j in tracker.jobs_data if j['scheduled']])} jobs scheduled")
         
         # Check if we have enough data for score calculation
-        if len(tracker.jobs_data) < 10 or len(tracker.carbon_window_data) < 10:
+        # Scale minimum required data based on number of episodes
+        min_jobs_required = max(20, total_episodes * 10)  # At least 20 jobs, or 10 per episode
+        if len(tracker.jobs_data) < min_jobs_required or len(tracker.carbon_window_data) < min_jobs_required:
             if debug:
                 print(f"  Insufficient data for score calculation (jobs: {len(tracker.jobs_data)}, windows: {len(tracker.carbon_window_data)})")
+                print(f"  Required: {min_jobs_required} jobs minimum (based on {total_episodes} episodes)")
+                print(f"  Consider running more episodes or longer episodes")
             return None
         
         # Prepare data for score calculation
@@ -630,8 +752,17 @@ def calculate_epoch_score(ppo_model, env, experiment_dir, epoch, workload, debug
             f.write("="*50 + "\n")
             f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"Score: {score:.6f}\n")
+            f.write(f"Episodes run: {total_episodes}\n")
             f.write(f"Jobs analyzed: {len(scheduled_jobs)}\n")
             f.write(f"Carbon windows captured: {len(tracker.carbon_window_data)}\n\n")
+            
+            # Add episode-level statistics
+            if episode_results:
+                avg_total_reward = sum(ep['total_reward'] for ep in episode_results) / len(episode_results)
+                avg_green_reward = sum(ep['green_reward'] for ep in episode_results) / len(episode_results)
+                f.write(f"Episode Statistics:\n")
+                f.write(f"Average total reward: {avg_total_reward:.2f}\n")
+                f.write(f"Average green reward: {avg_green_reward:.4f}\n\n")
             
             f.write("Carbon Emissions Regression Summary:\n")
             f.write(f"R-squared: {carbon_model.rsquared:.4f}\n")
@@ -648,11 +779,12 @@ def calculate_epoch_score(ppo_model, env, experiment_dir, epoch, workload, debug
         with open(scores_csv, 'a', newline='') as f:
             writer = csv.writer(f)
             if not file_exists:
-                writer.writerow(['epoch', 'score', 'carbon_r2', 'wait_r2', 'carbon_coef', 'wait_coef', 'jobs_analyzed'])
+                writer.writerow(['epoch', 'score', 'episodes_run', 'carbon_r2', 'wait_r2', 'carbon_coef', 'wait_coef', 'jobs_analyzed'])
             
             writer.writerow([
                 epoch,
                 score,
+                total_episodes,
                 carbon_model.rsquared,
                 wait_model.rsquared,
                 carbon_model.params['carbon_consideration'],
@@ -669,6 +801,100 @@ def calculate_epoch_score(ppo_model, env, experiment_dir, epoch, workload, debug
         if debug:
             print(f"  Score calculation failed: {str(e)}")
         return None
+
+def run_validation_episodes(ppo_model, validation_env, validation_episodes, debug=False):
+    """
+    Run validation episodes on a separate environment with fixed seed.
+    
+    Args:
+        ppo_model: The trained PPO model
+        validation_env: Validation environment with fixed seed
+        validation_episodes: Number of validation episodes to run
+        debug: Whether to print debug information
+        
+    Returns:
+        dict: Validation metrics including average rewards and episode statistics
+    """
+    validation_rewards = []
+    validation_green_rewards = []
+    validation_wait_rewards = []
+    validation_episode_lengths = []
+    validation_jobs_completed = []
+    
+    if debug:
+        print(f"    Running {validation_episodes} validation episodes...")
+    
+    for episode in range(validation_episodes):
+        # Reset validation environment
+        o, r, d = validation_env.reset(), 0, False
+        ep_ret, ep_len, green_reward, wait_reward = 0, 0, 0, 0
+        running_num = 0
+        jobs_completed = 0
+        
+        while not d:
+            # Build action masks (same logic as training)
+            lst = []
+            for i in range(0, MAX_QUEUE_SIZE * JOB_FEATURES, JOB_FEATURES):
+                job_slice = o[i:i + JOB_FEATURES]
+                
+                # Check for padding patterns
+                padding_pattern1 = [0, 1, 1, 1, 1, 0.5, 0]
+                padding_pattern2 = [1] * JOB_FEATURES
+                
+                if (len(job_slice) == len(padding_pattern1) and 
+                    all(abs(job_slice[j] - padding_pattern1[j]) < 1e-6 for j in range(len(job_slice)))):
+                    lst.append(1)  # Mask out (invalid)
+                elif (len(job_slice) == len(padding_pattern2) and 
+                      all(abs(job_slice[j] - padding_pattern2[j]) < 1e-6 for j in range(len(job_slice)))):
+                    lst.append(1)  # Mask out (invalid)
+                else:
+                    lst.append(0)  # Valid job
+            
+            mask2 = np.zeros(action2_num, dtype=int)
+            if running_num < delayMaxJobNum:
+                mask2[running_num + 1 : delayMaxJobNum + 1] = 1
+            
+            # Get action from policy (deterministic evaluation)
+            action1, action2 = ppo_model.eval_action(o, lst, mask2)
+            
+            # Step environment
+            o, r, d, r2, sjf_t, f1_t, running_num, greenRwd = \
+                validation_env.step(action1.item(), action2.item())
+            
+            # Accumulate rewards
+            ep_ret += r + greenRwd  # Total reward (wait + green)
+            wait_reward += r
+            green_reward += greenRwd
+            ep_len += 1
+            
+            # Count completed jobs (when episode ends)
+            if d:
+                # Rough estimate: count the valid jobs that were processed
+                jobs_completed = ep_len  # This is an approximation
+        
+        # Store episode metrics
+        validation_rewards.append(ep_ret)
+        validation_green_rewards.append(green_reward)
+        validation_wait_rewards.append(wait_reward)
+        validation_episode_lengths.append(ep_len)
+        validation_jobs_completed.append(jobs_completed)
+        
+        if debug:
+            print(f"      Episode {episode + 1}: {ep_len} steps, reward: {ep_ret:.4f} (green: {green_reward:.4f}, wait: {wait_reward:.4f})")
+    
+    # Calculate validation metrics
+    validation_metrics = {
+        'avg_total_reward': sum(validation_rewards) / len(validation_rewards),
+        'avg_green_reward': sum(validation_green_rewards) / len(validation_green_rewards),
+        'avg_wait_reward': sum(validation_wait_rewards) / len(validation_wait_rewards),
+        'avg_episode_length': sum(validation_episode_lengths) / len(validation_episode_lengths),
+        'avg_jobs_completed': sum(validation_jobs_completed) / len(validation_jobs_completed),
+        'std_total_reward': np.std(validation_rewards),
+        'median_total_reward': np.median(validation_rewards),
+        'episodes_run': validation_episodes
+    }
+    
+    return validation_metrics
 
 def setup_experiment_directory(workload, experiment_name, description):
     """
@@ -718,7 +944,7 @@ def setup_experiment_directory(workload, experiment_name, description):
     
     return experiment_dir
         
-def train(workload, backfill, debug=False, experiment_name="", description=""):
+def train(workload, backfill, debug=False, experiment_name="", description="", no_score=False, validate_every_n_epochs=False):
     print("Training called")
     # ------------------------------------------------------------------
     # 1. Experiment-wide hyper-parameters & environment construction
@@ -730,6 +956,16 @@ def train(workload, backfill, debug=False, experiment_name="", description=""):
     seed       = int(config.get('training parameters', 'seed'))
     epochs     = int(config.get('training parameters', 'epochs'))
     traj_num   = int(config.get('training parameters', 'traj_num'))
+    
+    # Validation parameters
+    validation_episodes = int(config.get('training parameters', 'validation_episodes', fallback=5))
+    validation_seed = int(config.get('training parameters', 'validation_seed', fallback=42))
+    validation_interval = int(config.get('training parameters', 'validation_interval', fallback=5))
+    
+    # Load delay time list for debug statistics
+    delaytimelist_str = config.get('GAS-MARL setting', 'delaytimelist')
+    # Parse the list string to actual list (format: [1100,2200,5400,10800,21600,43200,86400])
+    delaytimelist = eval(delaytimelist_str)
     
     # Setup experiment directory structure
     experiment_dir = setup_experiment_directory(workload, experiment_name, description)
@@ -775,6 +1011,15 @@ def train(workload, backfill, debug=False, experiment_name="", description=""):
     
     print(f"Using workload: {workload_file}")
     env.my_init(workload_file=workload_file)  # load the SWF trace
+    
+    # Create separate validation environment with fixed seed for consistent evaluation
+    validation_env = None
+    if validate_every_n_epochs:
+        validation_env = HPCEnv(backfill=backfill, debug=False)  # No debug for validation
+        validation_env.seed(validation_seed)  # Fixed seed for reproducible validation
+        validation_env.my_init(workload_file=workload_file)
+        print(f"Validation environment created with seed: {validation_seed}")
+        print(f"Validation will run every {validation_interval} epochs with {validation_episodes} episodes")
     
     if debug:
         print(f"DEBUG: Workload loaded successfully")
@@ -833,6 +1078,17 @@ def train(workload, backfill, debug=False, experiment_name="", description=""):
         # --------------------------------------------------------------
         trajectory_stats = {"valid_jobs": [], "actions": [], "rewards": []}
         
+        # Enhanced action statistics for debug mode
+        if debug:
+            epoch_action_stats = {
+                "action1_choices": [],      # job selection indices
+                "action2_choices": [],      # delay choices
+                "episode_lengths": [],     # steps per episode
+                "backfill_actions": [],    # action2 > 0 indicates delay/backfill
+                "delay_times": [],         # actual delay times in seconds
+                "valid_jobs_per_step": []  # number of valid jobs per step
+            }
+        
         while True:
             # ----------------------------------------------------------
             # 5-a. Build action masks
@@ -887,6 +1143,22 @@ def train(workload, backfill, debug=False, experiment_name="", description=""):
             # Collect action stats
             trajectory_stats["actions"].append((action1.item(), action2.item()))
             
+            # Enhanced debug statistics collection
+            if debug:
+                epoch_action_stats["action1_choices"].append(action1.item())
+                epoch_action_stats["action2_choices"].append(action2.item())
+                epoch_action_stats["valid_jobs_per_step"].append(valid_jobs)
+                
+                # Check if this is a backfill action (delay > 0)
+                if action2.item() > 0:
+                    epoch_action_stats["backfill_actions"].append(action2.item())
+                    # Convert delay index to actual time using delaytimelist
+                    delay_index = action2.item() - 1  # action2 is 1-indexed for delays
+                    if 0 <= delay_index < len(delaytimelist):
+                        epoch_action_stats["delay_times"].append(delaytimelist[delay_index])
+                    else:
+                        epoch_action_stats["delay_times"].append(0)
+            
             # ----------------------------------------------------------
             # 5-c. Step the environment
             # ----------------------------------------------------------
@@ -914,7 +1186,10 @@ def train(workload, backfill, debug=False, experiment_name="", description=""):
             # 5-d. If episode ends → push terminal reward, maybe finish epoch
             # ----------------------------------------------------------
             if d:
-                assert(epoch_Reward == 0)
+                # Store episode length for debug stats
+                if debug:
+                    epoch_action_stats["episode_lengths"].append(ep_len)
+                
                 # Print aggregated trajectory summary for debugging
                 if debug and t < 3:
                     avg_valid_jobs = sum(trajectory_stats["valid_jobs"]) / len(trajectory_stats["valid_jobs"]) if trajectory_stats["valid_jobs"] else 0
@@ -945,34 +1220,196 @@ def train(workload, backfill, debug=False, experiment_name="", description=""):
         if debug:
             print(f"  Training policy for epoch {epoch + 1}...")
             
-        ppo.train()
+        training_metrics = ppo.train()
         
         # --------------------------------------------------------------
-        # 7. Logging: append averaged rewards to CSV
+        # 7. Enhanced metrics collection for logging
         # --------------------------------------------------------------
         avg_epoch_reward = epoch_reward / traj_num
         avg_green_reward = green_reward / traj_num
         avg_wait_reward = wait_reward / traj_num
         
-        # Save to experiment directory
+        # Collect episode return statistics from trajectory rewards
+        episode_returns = []
+        carbon_costs = []
+        latencies = []
+        
+        # Calculate episode-level metrics from collected rewards
+        for trajectory_rewards in trajectory_rewards_list if 'trajectory_rewards_list' in locals() else []:
+            episode_total = sum([r[0] + r[1] for r in trajectory_rewards])
+            episode_returns.append(episode_total)
+            carbon_costs.append(sum([r[1] for r in trajectory_rewards]))
+            latencies.append(sum([r[0] for r in trajectory_rewards]))
+        
+        # If no trajectory-level data is available, use averaged values
+        if not episode_returns:
+            episode_returns = [avg_epoch_reward] * traj_num
+            carbon_costs = [avg_green_reward] * traj_num  
+            latencies = [avg_wait_reward] * traj_num
+        
+        episode_return_mean = sum(episode_returns) / len(episode_returns) if episode_returns else avg_epoch_reward
+        episode_return_median = sorted(episode_returns)[len(episode_returns)//2] if episode_returns else avg_epoch_reward
+        carbon_cost_mean = sum(carbon_costs) / len(carbon_costs) if carbon_costs else avg_green_reward
+        latency_mean = sum(latencies) / len(latencies) if latencies else avg_wait_reward
+        
+        # Run validation if enabled and at the right interval
+        validation_metrics = None
+        if validate_every_n_epochs and (epoch + 1) % validation_interval == 0:
+            if debug:
+                print(f"  → Running validation for epoch {epoch + 1}...")
+            validation_metrics = run_validation_episodes(ppo, validation_env, validation_episodes, debug)
+        
+        # Save to experiment directory with enhanced metrics
         csv_file = f"{experiment_dir}/training_results.csv"
         # Write header if file doesn't exist
         if not os.path.exists(csv_file):
             with open(csv_file, mode="w", newline="") as file:
                 csv.writer(file).writerow([
-                    "epoch", "avg_epoch_reward", "avg_green_reward", "avg_wait_reward"
+                    "epoch", "episode_return_mean", "episode_return_median", "avg_epoch_reward", 
+                    "avg_green_reward", "avg_wait_reward", "carbon_cost_mean", "latency_mean",
+                    "policy_loss_clipped", "policy_loss_unclipped", "entropy", "approx_kl", 
+                    "clip_fraction", "value_loss", "explained_variance", "adv_mean", "adv_std",
+                    "validation_avg_total_reward", "validation_avg_green_reward", "validation_avg_wait_reward",
+                    "validation_std_total_reward", "validation_median_total_reward", "validation_avg_episode_length"
                 ])
         
         with open(csv_file, mode="a", newline="") as file:
             csv.writer(file).writerow([
                 epoch + 1,
+                episode_return_mean,
+                episode_return_median,
                 avg_epoch_reward,
                 avg_green_reward,
-                avg_wait_reward
+                avg_wait_reward,
+                carbon_cost_mean,
+                latency_mean,
+                training_metrics.get('policy_loss_clipped', 0) if training_metrics else 0,
+                training_metrics.get('policy_loss_unclipped', 0) if training_metrics else 0,
+                training_metrics.get('entropy', 0) if training_metrics else 0,
+                training_metrics.get('approx_kl', 0) if training_metrics else 0,
+                training_metrics.get('clip_fraction', 0) if training_metrics else 0,
+                training_metrics.get('value_loss', 0) if training_metrics else 0,
+                training_metrics.get('explained_variance', 0) if training_metrics else 0,
+                training_metrics.get('adv_mean', 0) if training_metrics else 0,
+                training_metrics.get('adv_std', 0) if training_metrics else 0,
+                validation_metrics.get('avg_total_reward', '') if validation_metrics else '',
+                validation_metrics.get('avg_green_reward', '') if validation_metrics else '',
+                validation_metrics.get('avg_wait_reward', '') if validation_metrics else '',
+                validation_metrics.get('std_total_reward', '') if validation_metrics else '',
+                validation_metrics.get('median_total_reward', '') if validation_metrics else '',
+                validation_metrics.get('avg_episode_length', '') if validation_metrics else ''
             ])
         
-        # Always show epoch summary (every epoch)
-        print(f"Epoch {epoch + 1:3d}/{epochs} | Total: {avg_epoch_reward:7.3f} | Green: {avg_green_reward:7.3f} | Wait: {avg_wait_reward:7.3f}")
+        # ══════════════════════════════════════════════════════════════
+        # COMPREHENSIVE EPOCH METRICS SUMMARY
+        # ══════════════════════════════════════════════════════════════
+        print(f"\n🎯 EPOCH {epoch + 1:3d}/{epochs} METRICS")
+        print(f"{'='*60}")
+        
+        # Top-line Performance
+        print(f"📊 TOP-LINE PERFORMANCE:")
+        print(f"   Episode Return Mean:   {episode_return_mean:8.4f}")
+        print(f"   Episode Return Median: {episode_return_median:8.4f}")
+        print(f"   Running Average:       {avg_epoch_reward:8.4f}")
+        
+        # Reward Decomposition  
+        print(f"🎨 REWARD DECOMPOSITION:")
+        print(f"   Carbon Cost Mean:      {carbon_cost_mean:8.4f}")
+        print(f"   Latency Mean:          {latency_mean:8.4f}")
+        print(f"   Green Reward:          {avg_green_reward:8.4f}")
+        print(f"   Wait Reward:           {avg_wait_reward:8.4f}")
+        
+        # Policy Optimization
+        print(f"🔧 POLICY OPTIMIZATION:")
+        if training_metrics:
+            print(f"   Policy Loss (Clipped): {training_metrics.get('policy_loss_clipped', 0):8.6f}")
+            print(f"   Policy Loss (Raw):     {training_metrics.get('policy_loss_unclipped', 0):8.6f}")
+            print(f"   Entropy:               {training_metrics.get('entropy', 0):8.6f}")
+            print(f"   Approx KL:             {training_metrics.get('approx_kl', 0):8.6f}")
+            print(f"   Clip Fraction:         {training_metrics.get('clip_fraction', 0):8.6f}")
+        else:
+            print(f"   [Training metrics not available]")
+        
+        # Critic Health
+        print(f"💡 CRITIC HEALTH:")
+        if training_metrics:
+            print(f"   Value Loss:            {training_metrics.get('value_loss', 0):8.6f}")
+            print(f"   Explained Variance:    {training_metrics.get('explained_variance', 0):8.6f}")
+        else:
+            print(f"   [Critic metrics not available]")
+        
+        # Advantages
+        print(f"⚡ ADVANTAGES:")
+        if training_metrics:
+            print(f"   Advantage Mean (Raw):  {training_metrics.get('adv_mean', 0):8.6f}")
+            print(f"   Advantage Std (Raw):   {training_metrics.get('adv_std', 0):8.6f}")
+            print(f"   Advantage Mean (Norm): {training_metrics.get('adv_normalized_mean', 0):8.6f}")
+            print(f"   Advantage Std (Norm):  {training_metrics.get('adv_normalized_std', 0):8.6f}")
+        else:
+            print(f"   [Advantage metrics not available]")
+        
+        print(f"{'='*60}")
+        
+        # Legacy compact summary for quick reference
+        print(f"Epoch {epoch + 1:3d} | Ret: {episode_return_mean:7.3f} | Green: {avg_green_reward:7.3f} | Wait: {avg_wait_reward:7.3f}")
+        
+        # Display validation results if available
+        if validation_metrics:
+            print(f"📋 VALIDATION RESULTS (Epoch {epoch + 1}):")
+            print(f"   Avg Total Reward:    {validation_metrics['avg_total_reward']:8.4f} ± {validation_metrics['std_total_reward']:6.4f}")
+            print(f"   Avg Green Reward:    {validation_metrics['avg_green_reward']:8.4f}")
+            print(f"   Avg Wait Reward:     {validation_metrics['avg_wait_reward']:8.4f}")
+            print(f"   Median Total Reward: {validation_metrics['median_total_reward']:8.4f}")
+            print(f"   Avg Episode Length:  {validation_metrics['avg_episode_length']:8.1f} steps")
+        
+        # Enhanced debug statistics after each epoch
+        if debug and 'epoch_action_stats' in locals():
+            print(f"  ═══ Epoch {epoch + 1} Action Statistics ═══")
+            
+            # Episode statistics
+            if epoch_action_stats["episode_lengths"]:
+                avg_episode_length = sum(epoch_action_stats["episode_lengths"]) / len(epoch_action_stats["episode_lengths"])
+                print(f"  📊 Episodes: {len(epoch_action_stats['episode_lengths'])} total, avg {avg_episode_length:.1f} steps/episode")
+            
+            # Job selection (action1) statistics
+            if epoch_action_stats["action1_choices"]:
+                action1_distribution = {}
+                for action in epoch_action_stats["action1_choices"]:
+                    action1_distribution[action] = action1_distribution.get(action, 0) + 1
+                top_job_choices = sorted(action1_distribution.items(), key=lambda x: x[1], reverse=True)[:5]
+                print(f"  🎯 Job Selection: Top job indices chosen: {top_job_choices}")
+                print(f"      Avg job index: {sum(epoch_action_stats['action1_choices']) / len(epoch_action_stats['action1_choices']):.1f}")
+            
+            # Delay/backfill (action2) statistics
+            total_actions = len(epoch_action_stats["action2_choices"])
+            immediate_schedules = epoch_action_stats["action2_choices"].count(0)
+            backfill_count = total_actions - immediate_schedules
+            
+            if total_actions > 0:
+                print(f"  ⏰ Scheduling: {immediate_schedules}/{total_actions} ({immediate_schedules/total_actions*100:.1f}%) immediate")
+                print(f"      Backfill: {backfill_count}/{total_actions} ({backfill_count/total_actions*100:.1f}%) delayed")
+                
+                if epoch_action_stats["delay_times"]:
+                    avg_delay = sum(epoch_action_stats["delay_times"]) / len(epoch_action_stats["delay_times"])
+                    max_delay = max(epoch_action_stats["delay_times"])
+                    print(f"      Delays: avg {avg_delay/3600:.1f}h, max {max_delay/3600:.1f}h ({len(epoch_action_stats['delay_times'])} delays)")
+                    
+                    # Delay distribution
+                    delay_distribution = {}
+                    for delay in epoch_action_stats["delay_times"]:
+                        delay_hours = round(delay / 3600, 1)
+                        delay_distribution[delay_hours] = delay_distribution.get(delay_hours, 0) + 1
+                    top_delays = sorted(delay_distribution.items(), key=lambda x: x[1], reverse=True)[:3]
+                    print(f"      Top delay times: {top_delays} (hours)")
+            
+            # Valid jobs statistics
+            if epoch_action_stats["valid_jobs_per_step"]:
+                avg_valid_jobs = sum(epoch_action_stats["valid_jobs_per_step"]) / len(epoch_action_stats["valid_jobs_per_step"])
+                min_valid = min(epoch_action_stats["valid_jobs_per_step"])
+                max_valid = max(epoch_action_stats["valid_jobs_per_step"])
+                print(f"  📋 Queue Load: avg {avg_valid_jobs:.1f} valid jobs/step (range: {min_valid}-{max_valid})")
+            
+            print(f"  ══════════════════════════════════════")
         
         # Save model weights every 5 epochs
         if (epoch + 1) % 5 == 0:
@@ -982,13 +1419,14 @@ def train(workload, backfill, debug=False, experiment_name="", description=""):
                 print(f"  → Checkpoint saved: epoch_{epoch + 1}/")
             
             # Calculate score every 5th epoch
-            if debug:
-                print(f"  → Calculating score for epoch {epoch + 1}...")
-            score = calculate_epoch_score(ppo, env, experiment_dir, epoch + 1, workload, debug)
-            if score is not None:
-                print(f"Epoch {epoch + 1:3d} Score: {score:7.4f}")
-            else:
-                print(f"Epoch {epoch + 1:3d} Score: calculation skipped")
+            if not no_score:
+                if debug:
+                    print(f"  → Calculating score for epoch {epoch + 1}...")
+                score = calculate_epoch_score(ppo, env, experiment_dir, epoch + 1, workload, debug)
+                if score is not None:
+                    print(f"Epoch {epoch + 1:3d} Score: {score:7.4f}")
+                else:
+                    print(f"Epoch {epoch + 1:3d} Score: calculation skipped")
         
         # clear buffers so next epoch starts fresh
         ppo.buffer.clear_buffer()
@@ -1019,5 +1457,7 @@ if __name__ == "__main__":
     parser.add_argument('--debug', action='store_true', help='Enable debug prints')
     parser.add_argument('--name', type=str, required=True, help='Experiment name (e.g., ED12)')
     parser.add_argument('--description', type=str, default='', help='Description of the experiment')
+    parser.add_argument('--no-score', action='store_true', help='Disable score calculation during training')
+    parser.add_argument('--validate', action='store_true', help='Enable validation every N epochs on a fixed validation set')
     args = parser.parse_args()
-    train(args.workload, args.backfill, args.debug, args.name, args.description)
+    train(args.workload, args.backfill, args.debug, args.name, args.description, args.no_score, args.validate)

@@ -1,0 +1,2 @@
+episode,total_reward,green_reward,jobs_completed,jobs_scheduled,jobs_actually_completed,makespan,avg_wait_time
+1,-54.01963491274922,-24.075425930151063,195241,655,1024,0,26146.925190839695

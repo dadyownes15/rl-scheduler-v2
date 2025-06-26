@@ -82,6 +82,10 @@ class HPCEnv(gym.Env):
 
         # Episode-specific carbon-timeline offset (in hours)
         self.episode_start_hour_offset = 0
+        
+        # Curriculum learning for carbon intensity
+        self.curriculum_tau = 1.0  # Default to hardest (real trace)
+        self.sampler = None  # Will be initialized in my_init
 
 
     # @profile
@@ -90,11 +94,57 @@ class HPCEnv(gym.Env):
         self.loads = Workloads(workload_file)
         self.cluster = Cluster("Cluster", self.loads.max_nodes, self.loads.max_procs / self.loads.max_nodes, processor_per_machine, idlePower, green_win, year=carbon_year)
         
+        # Initialize carbon intensity sampler for curriculum learning
+        from carbon_sampler import CarbonSampler
+        self.sampler = CarbonSampler.from_csv(
+            csv_path="data/DK-DK2_hourly_carbon_intensity_noFeb29.csv",
+            year=carbon_year,
+            horizon=green_win
+        )
+        
+        if self.debug:
+            stats = self.sampler.get_stats()
+            print(f"Carbon sampler initialized:")
+            print(f"  Mean intensity: {stats['mean']:.2f} gCO2eq/kWh")
+            print(f"  Std deviation: {stats['std']:.2f} gCO2eq/kWh")
+            print(f"  Range: {stats['min']:.2f} - {stats['max']:.2f} gCO2eq/kWh")
+            print(f"  Data points: {stats['length']}")
+        
         # Verification: Check that environment is properly initialized with carbon-aware components
         if self.debug:
             assert hasattr(self.cluster, 'PowerStruc'), "Cluster should have PowerStruc"
             assert hasattr(self.cluster, 'carbonIntensity'), "Cluster should have carbonIntensity"
             assert type(self.cluster.PowerStruc).__name__ == 'power_struc_carbon', f"PowerStruc should be power_struc_carbon, got {type(self.cluster.PowerStruc).__name__}"
+
+    def safe_get_job(self, job_index, context="unknown"):
+        """
+        Safely get a job by index with bounds checking.
+        
+        Args:
+            job_index: Index of the job to retrieve
+            context: String describing where this is called from for debugging
+            
+        Returns:
+            Job object if valid index, None if out of bounds
+        """
+        if job_index < 0:
+            if hasattr(self, 'debug') and self.debug:
+                print(f"WARNING: Negative job index {job_index} in {context}")
+            return None
+            
+        if not hasattr(self, 'loads') or self.loads is None:
+            if hasattr(self, 'debug') and self.debug:
+                print(f"WARNING: No workload loaded when accessing job {job_index} in {context}")
+            return None
+            
+        if job_index >= len(self.loads.all_jobs):
+            if hasattr(self, 'debug') and self.debug:
+                print(f"WARNING: Job index {job_index} >= workload size {len(self.loads.all_jobs)} in {context}")
+                print(f"         last_job_in_batch: {getattr(self, 'last_job_in_batch', 'unknown')}")
+                print(f"         start: {getattr(self, 'start', 'unknown')}")
+            return None
+            
+        return self.loads[job_index]
 
     def seed(self, seed=None):
         self.np_random, seed = seeding.np_random(seed)
@@ -164,13 +214,36 @@ class HPCEnv(gym.Env):
         self.cluster.reset()
         self.loads.reset()
 
-        # ---------- choose a fresh carbon-intensity start hour ----------
-        max_hours = len(self.cluster.carbonIntensity.carbonIntensityList)
-        if hasattr(self.np_random, 'integers'):
-            self.episode_start_hour_offset = int(self.np_random.integers(0, max_hours))
+        # ---------- curriculum-driven carbon profile selection ----------
+        if self.sampler is not None:
+            # Sample carbon profile based on curriculum parameter
+            self.carbon_profile = self.sampler.sample(self.curriculum_tau)
+            
+            # Instead of overriding the full list, extend the curriculum profile to cover the full year
+            # This ensures carbon reward calculations that might look beyond the window still work
+            full_year_hours = len(self.cluster.carbonIntensity.carbonIntensityList)
+            extended_profile = []
+            
+            # Tile the curriculum profile to cover a full year
+            profile_length = len(self.carbon_profile)
+            for hour in range(full_year_hours):
+                extended_profile.append(self.carbon_profile[hour % profile_length])
+            
+            # Override the cluster's carbon intensity with extended curriculum profile
+            self.cluster.carbonIntensity.carbonIntensityList = extended_profile
+            
+            # Reset start offset to 0 since we're using our own profile
+            self.cluster.carbonIntensity.setStartOffset(0)
+            
+
         else:
-            self.episode_start_hour_offset = int(self.np_random.randint(0, max_hours))
-        self.cluster.carbonIntensity.setStartOffset(self.episode_start_hour_offset)
+            # Fallback to original random offset behavior
+            max_hours = len(self.cluster.carbonIntensity.carbonIntensityList)
+            if hasattr(self.np_random, 'integers'):
+                self.episode_start_hour_offset = int(self.np_random.integers(0, max_hours))
+            else:
+                self.episode_start_hour_offset = int(self.np_random.randint(0, max_hours))
+            self.cluster.carbonIntensity.setStartOffset(self.episode_start_hour_offset)
         # ---------------------------------------------------------------
 
         self.job_queue = []
@@ -578,6 +651,229 @@ class HPCEnv(gym.Env):
                 self.cluster.release(next_resource_release_machines)
                 self.running_jobs.pop(0)  # remove the first running job.
 
+    def moveforward_for_resources_backfill_neural(self, job, a3):
+        """
+        Neural network-based backfill resource movement (backfill == 3)
+        Uses FCFS queue sorting and neural network action a3 for job selection
+        """
+        # note that this function is only called when current job can not be scheduled.
+        assert not self.cluster.can_allocated(job)
+
+        earliest_start_time = self.current_timestamp
+        # sort all running jobs by estimated finish time
+        self.running_jobs.sort(key=lambda running_job: (running_job.scheduled_time + running_job.request_time))
+        free_processors = self.cluster.free_node * self.cluster.num_procs_per_node
+        for running_job in self.running_jobs:
+            free_processors += len(running_job.allocated_machines) * self.cluster.num_procs_per_node
+            earliest_start_time = (running_job.scheduled_time + running_job.request_time)
+            if free_processors >= job.request_number_of_processors:
+                break
+
+        while not self.cluster.can_allocated(job):
+            # Use FCFS sorting for neural backfill
+            self.job_queue.sort(key=lambda _j: self.fcfs_score(_j))
+            
+            # Filter backfillable jobs and create mapping
+            backfillable_jobs = []
+            
+            for _j in self.job_queue:
+                if (_j != job and 
+                    (self.current_timestamp + _j.request_time) < earliest_start_time and 
+                    self.cluster.backfill_check(self.running_jobs, _j, self.current_timestamp, self.backfill)):
+                    backfillable_jobs.append(_j)
+            
+            # If no jobs can be backfilled, skip this step like easy backfill
+            if not backfillable_jobs:
+                # No backfilling possible, just advance time
+                pass
+            else:
+                # Use neural network action to select backfill job
+                if a3 < len(backfillable_jobs):
+                    selected_job = backfillable_jobs[a3]
+                    
+                    # Schedule the selected job
+                    assert selected_job.scheduled_time == -1  # this job should never be scheduled before.
+                    selected_job.scheduled_time = self.current_timestamp
+                    selected_job.allocated_machines = self.cluster.allocate(selected_job.job_id, selected_job.request_number_of_processors)
+                    self.cluster.PowerStruc.update(selected_job.scheduled_time,
+                                                   selected_job.scheduled_time + selected_job.run_time,
+                                                   selected_job.power, selected_job.job_id)
+                    self.running_jobs.append(selected_job)
+                    score = self.job_score(selected_job)  # calculated reward
+                    self.scheduled_rl[selected_job.job_id] = score
+                    self.job_queue.remove(selected_job)  # remove the job from job queue
+
+            # move to the next timestamp
+            assert self.running_jobs
+            self.running_jobs.sort(key=lambda running_job: (running_job.scheduled_time + running_job.run_time))
+            next_resource_release_time = (self.running_jobs[0].scheduled_time + self.running_jobs[0].run_time)
+            next_resource_release_machines = self.running_jobs[0].allocated_machines
+
+            nextGreenChange = ((self.current_timestamp // 3600) + 1) * 3600
+            if self.next_arriving_job_idx < self.last_job_in_batch \
+                    and self.loads[self.next_arriving_job_idx].submit_time <= min(next_resource_release_time,nextGreenChange):
+                self.current_timestamp = max(self.current_timestamp, self.loads[self.next_arriving_job_idx].submit_time)
+                self.cluster.PowerStruc.updateCurrentTime(self.current_timestamp)
+                self.job_queue.append(self.loads[self.next_arriving_job_idx])
+                self.next_arriving_job_idx += 1
+            elif nextGreenChange < next_resource_release_time:
+                self.current_timestamp = max(self.current_timestamp, nextGreenChange)
+                self.cluster.PowerStruc.updateCurrentTime(self.current_timestamp)
+            else:
+                self.current_timestamp = max(self.current_timestamp, next_resource_release_time)
+                self.cluster.PowerStruc.updateCurrentTime(self.current_timestamp)
+                self.cluster.release(next_resource_release_machines)
+                self.running_jobs.pop(0)  # remove the first running job
+        self.job_queue.sort(key=lambda _j: self.fcfs_score(_j))
+
+    def moveforward_green_backfilling_delay_action1_neural(self, job, a, a3):
+        """
+        Neural network-based green backfilling with delay action1 (backfill == 3)
+        """
+        self.running_jobs.sort(key=lambda running_job: (running_job.scheduled_time + running_job.request_time))
+        release_index=a-1
+        release_time = (self.running_jobs[release_index].scheduled_time + self.running_jobs[release_index].request_time)
+        skipTime = min(release_time,3600+self.current_timestamp)
+
+        earliest_start_time = self.current_timestamp
+        # sort all running jobs by estimated finish time
+        free_processors = self.cluster.free_node * self.cluster.num_procs_per_node
+        if free_processors < job.request_number_of_processors:
+            for running_job in self.running_jobs:
+                free_processors += len(running_job.allocated_machines) * self.cluster.num_procs_per_node
+                earliest_start_time = (running_job.scheduled_time + running_job.request_time)
+                if free_processors >= job.request_number_of_processors:
+                    break
+        earliest_start_time = max(earliest_start_time, skipTime)
+
+        while not self.cluster.can_allocated(job) or self.current_timestamp<skipTime:
+            # Use FCFS sorting for neural backfill
+            self.job_queue.sort(key=lambda _j: self.fcfs_score(_j))
+            
+            # Filter backfillable jobs
+            backfillable_jobs = []
+            for _j in self.job_queue:
+                if (_j != job and 
+                    (self.current_timestamp + _j.request_time) < earliest_start_time and 
+                    self.cluster.backfill_check(self.running_jobs, _j, self.current_timestamp, self.backfill)):
+                    backfillable_jobs.append(_j)
+            
+            # If jobs can be backfilled, use neural selection
+            if backfillable_jobs and a3 < len(backfillable_jobs):
+                selected_job = backfillable_jobs[a3]
+                
+                # Schedule the selected job
+                assert selected_job.scheduled_time == -1  # this job should never be scheduled before.
+                selected_job.scheduled_time = self.current_timestamp
+                selected_job.allocated_machines = self.cluster.allocate(selected_job.job_id, selected_job.request_number_of_processors)
+                self.cluster.PowerStruc.update(selected_job.scheduled_time,
+                                               selected_job.scheduled_time + selected_job.run_time,
+                                               selected_job.power, selected_job.job_id)
+                self.running_jobs.append(selected_job)
+                score = self.job_score(selected_job)  # calculated reward
+                self.scheduled_rl[selected_job.job_id] = score
+                self.job_queue.remove(selected_job)  # remove the job from job queue
+
+            # move to the next timestamp
+            assert self.running_jobs
+            self.running_jobs.sort(key=lambda running_job: (running_job.scheduled_time + running_job.run_time))
+            next_resource_release_time = (self.running_jobs[0].scheduled_time + self.running_jobs[0].run_time)
+            next_resource_release_machines = self.running_jobs[0].allocated_machines
+
+            nextGreenChange = ((self.current_timestamp // 3600) + 1) * 3600
+            if self.next_arriving_job_idx < self.last_job_in_batch \
+                    and self.loads[self.next_arriving_job_idx].submit_time <= min(next_resource_release_time,nextGreenChange):
+                self.current_timestamp = max(self.current_timestamp, self.loads[self.next_arriving_job_idx].submit_time)
+                self.cluster.PowerStruc.updateCurrentTime(self.current_timestamp)
+                self.job_queue.append(self.loads[self.next_arriving_job_idx])
+                self.next_arriving_job_idx += 1
+            elif nextGreenChange < next_resource_release_time:
+                self.current_timestamp = max(self.current_timestamp, nextGreenChange)
+                self.cluster.PowerStruc.updateCurrentTime(self.current_timestamp)
+            else:
+                self.current_timestamp = max(self.current_timestamp, next_resource_release_time)
+                self.cluster.PowerStruc.updateCurrentTime(self.current_timestamp)
+                self.cluster.release(next_resource_release_machines)
+                self.running_jobs.pop(0)  # remove the first running job
+
+    def moveforward_green_backfilling_delay_action2_neural(self, job, ToskipTime, a3):
+        """
+        Neural network-based green backfilling with delay action2 (backfill == 3)
+        """
+        self.running_jobs.sort(key=lambda running_job: (running_job.scheduled_time + running_job.request_time))
+        skipTime = ToskipTime+self.current_timestamp
+
+        earliest_start_time = self.current_timestamp
+        # sort all running jobs by estimated finish time
+        free_processors = self.cluster.free_node * self.cluster.num_procs_per_node
+        if free_processors < job.request_number_of_processors:
+            for running_job in self.running_jobs:
+                free_processors += len(running_job.allocated_machines) * self.cluster.num_procs_per_node
+                earliest_start_time = (running_job.scheduled_time + running_job.request_time)
+                if free_processors >= job.request_number_of_processors:
+                    break
+        earliest_start_time = max(earliest_start_time, skipTime)
+
+        while not self.cluster.can_allocated(job) or self.current_timestamp<skipTime:
+            # Use FCFS sorting for neural backfill
+            self.job_queue.sort(key=lambda _j: self.fcfs_score(_j))
+            
+            # Filter backfillable jobs
+            backfillable_jobs = []
+            for _j in self.job_queue:
+                if (_j != job and 
+                    (self.current_timestamp + _j.request_time) < earliest_start_time and 
+                    self.cluster.backfill_check(self.running_jobs, _j, self.current_timestamp, self.backfill)):
+                    backfillable_jobs.append(_j)
+            
+            # If jobs can be backfilled, use neural selection
+            if backfillable_jobs and a3 < len(backfillable_jobs):
+                selected_job = backfillable_jobs[a3]
+                
+                # Schedule the selected job
+                assert selected_job.scheduled_time == -1  # this job should never be scheduled before.
+                selected_job.scheduled_time = self.current_timestamp
+                selected_job.allocated_machines = self.cluster.allocate(selected_job.job_id, selected_job.request_number_of_processors)
+                self.cluster.PowerStruc.update(selected_job.scheduled_time,
+                                               selected_job.scheduled_time + selected_job.run_time,
+                                               selected_job.power, selected_job.job_id)
+                self.running_jobs.append(selected_job)
+                score = self.job_score(selected_job)  # calculated reward
+                self.scheduled_rl[selected_job.job_id] = score
+                self.job_queue.remove(selected_job)  # remove the job from job queue
+
+            next_resource_release_time = sys.maxsize  # always add jobs if no resource can be released.
+            next_resource_release_machines = []
+            if self.running_jobs:  # there are running jobs
+                self.running_jobs.sort(key=lambda running_job: (running_job.scheduled_time + running_job.run_time))
+                next_resource_release_time = (self.running_jobs[0].scheduled_time + self.running_jobs[0].run_time)
+                next_resource_release_machines = self.running_jobs[0].allocated_machines
+
+            next_job_sumbitTime = sys.maxsize
+            if self.next_arriving_job_idx < self.last_job_in_batch:
+                next_job_sumbitTime = self.loads[self.next_arriving_job_idx].submit_time
+
+            if skipTime < min(next_job_sumbitTime,next_resource_release_time):
+                self.current_timestamp = max(self.current_timestamp,skipTime)
+                self.cluster.PowerStruc.updateCurrentTime(self.current_timestamp)
+                return
+            if next_job_sumbitTime <= next_resource_release_time:
+                self.current_timestamp = max(self.current_timestamp,
+                                             self.loads[self.next_arriving_job_idx].submit_time)
+                self.cluster.PowerStruc.updateCurrentTime(self.current_timestamp)
+                self.job_queue.append(self.loads[self.next_arriving_job_idx])
+                self.next_arriving_job_idx += 1
+
+                if self.next_arriving_job_idx < self.last_job_in_batch:
+                    next_job_sumbitTime = self.loads[self.next_arriving_job_idx].submit_time
+                else:
+                    next_job_sumbitTime=sys.maxsize
+            else:
+                self.current_timestamp = max(self.current_timestamp, next_resource_release_time)
+                self.cluster.PowerStruc.updateCurrentTime(self.current_timestamp)
+                self.cluster.release(next_resource_release_machines)
+                self.running_jobs.pop(0)  # remove the first running job.
+
     # @profile
     def moveforward_for_job(self):
         if self.job_queue:
@@ -585,6 +881,14 @@ class HPCEnv(gym.Env):
 
         # if we need to add job, but can not add any more, return False indicating the job_queue is for sure empty now.
         if self.next_arriving_job_idx >= self.last_job_in_batch:
+            assert not self.job_queue
+            return False
+
+        # CRITICAL FIX: Add additional bounds check against actual workload size
+        if self.next_arriving_job_idx >= len(self.loads.all_jobs):
+            if hasattr(self, 'debug') and self.debug:
+                print(f"WARNING: next_arriving_job_idx ({self.next_arriving_job_idx}) >= workload size ({len(self.loads.all_jobs)})")
+                print(f"         last_job_in_batch: {self.last_job_in_batch}, start: {self.start}")
             assert not self.job_queue
             return False
 
@@ -598,7 +902,9 @@ class HPCEnv(gym.Env):
                 next_resource_release_time = (self.running_jobs[0].scheduled_time + self.running_jobs[0].run_time)
                 next_resource_release_machines = self.running_jobs[0].allocated_machines
 
-            if self.loads[self.next_arriving_job_idx].submit_time <= next_resource_release_time:
+            # CRITICAL FIX: Always check bounds before accessing job
+            if (self.next_arriving_job_idx < len(self.loads.all_jobs) and 
+                self.loads[self.next_arriving_job_idx].submit_time <= next_resource_release_time):
                 self.current_timestamp = max(self.current_timestamp, self.loads[self.next_arriving_job_idx].submit_time)
                 self.cluster.PowerStruc.updateCurrentTime(self.current_timestamp)
                 self.job_queue.append(self.loads[self.next_arriving_job_idx])
@@ -853,7 +1159,9 @@ class HPCEnv(gym.Env):
             if skipTime > self.current_timestamp and skipTime < min(next_job_sumbitTime,next_resource_release_time,nextGreenChange):
                 self.current_timestamp = max(self.current_timestamp,skipTime)
                 self.cluster.PowerStruc.updateCurrentTime(self.current_timestamp)
-            elif next_job_sumbitTime <= min(next_resource_release_time,nextGreenChange):
+            elif (next_job_sumbitTime <= min(next_resource_release_time,nextGreenChange) and 
+                  self.next_arriving_job_idx < self.last_job_in_batch and  # BOUNDS CHECK
+                  self.next_arriving_job_idx < len(self.loads.all_jobs)):    # ADDITIONAL BOUNDS CHECK
                 self.current_timestamp = max(self.current_timestamp,
                                              self.loads[self.next_arriving_job_idx].submit_time)
                 self.cluster.PowerStruc.updateCurrentTime(self.current_timestamp)
@@ -912,6 +1220,44 @@ class HPCEnv(gym.Env):
             self.skip2(skipTime)
         if not self.cluster.can_allocated(job_for_scheduling):
             self.moveforward_for_resources_backfill(job_for_scheduling)
+
+        # we should be OK to schedule the job now
+        assert job_for_scheduling.scheduled_time == -1  # this job should never be scheduled before.
+        job_for_scheduling.scheduled_time = self.current_timestamp
+        job_for_scheduling.allocated_machines = self.cluster.allocate(job_for_scheduling.job_id,
+                                                                      job_for_scheduling.request_number_of_processors)
+        self.cluster.PowerStruc.update(job_for_scheduling.scheduled_time,
+                                       job_for_scheduling.scheduled_time + job_for_scheduling.run_time,
+                                       job_for_scheduling.power, job_for_scheduling.job_id)
+        self.running_jobs.append(job_for_scheduling)
+        score = self.job_score(job_for_scheduling)  # calculated reward
+        self.scheduled_rl[job_for_scheduling.job_id] = score
+        self.job_queue.remove(job_for_scheduling)  # remove the job from job queue
+
+        # after scheduling, check if job queue is empty, try to add jobs.
+        not_empty = self.moveforward_for_job()
+
+        if not_empty:
+            # job_queue is not empty
+            return False
+        else:
+            # job_queue is empty and can not add new jobs as we reach the end of the sequence
+            return True
+
+    def schedule_backfill_neural(self, job_for_scheduling, a2, a3):
+        """
+        Neural network-based backfill scheduling (backfill == 3)
+        Uses FCFS queue sorting and neural network for backfill job selection
+        """
+        if a2==0:
+            if not self.cluster.can_allocated(job_for_scheduling):
+                self.moveforward_for_resources_backfill_neural(job_for_scheduling, a3)
+        else:
+            if a2 >0 and a2<=delayMaxJobNum:
+                self.moveforward_green_backfilling_delay_action1_neural(job_for_scheduling, a2, a3)
+            elif a2 > delayMaxJobNum:
+                ToskipTime = delayTimeList[a2 - delayMaxJobNum - 1]
+                self.moveforward_green_backfilling_delay_action2_neural(job_for_scheduling, ToskipTime, a3)
 
         # we should be OK to schedule the job now
         assert job_for_scheduling.scheduled_time == -1  # this job should never be scheduled before.
@@ -1007,7 +1353,7 @@ class HPCEnv(gym.Env):
 
         return scheduled_logs,carbonRwd
 
-    def step(self, a1, a2):
+    def step(self, a1, a2, a3=None):
         # Check if a1 is valid and points to an actual job (not padding)
         if a1 >= len(self.pairs) or self.pairs[a1][0] is None:
             # Invalid action - return neutral state
@@ -1017,8 +1363,10 @@ class HPCEnv(gym.Env):
         job_for_scheduling = self.pairs[a1][0]
         if self.backfill==1:
             done=self.schedule_backfill(job_for_scheduling,a2)
-        if self.backfill==2:
+        elif self.backfill==2:
             done=self.schedule_backfill_EASY(job_for_scheduling,a2)
+        elif self.backfill==3:
+            done=self.schedule_backfill_neural(job_for_scheduling,a2,a3)
         elif self.backfill==0:
             if a2 >0 and a2<=delayMaxJobNum:
                 self.skip1(a2)
