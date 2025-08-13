@@ -2,6 +2,24 @@
 
 GAS-MARL is a green-aware job scheduling algorithm for HPC clusters based on multi-action deep reinforcement learning, which optimizes both renewable energy utilization and average bounded slowdown. This repository contains the source code of GAS-MARL and the datasets used.
 
+## Data Generation
+
+### Creating Carbon-Aware Workload Files
+
+The system supports different modes for generating carbon consideration values in the workload files:
+
+- **Uniform Mode**: Random values between 0.0 and 1.0 (default)
+- **Simple Mode**: Three discrete levels (0.0: 80%, 0.5: 10%, 1.0: 10%)
+- **Constant Mode**: Same value for all jobs
+- **Binary Mode**: Two types of jobs (0.0: 50% no carbon concern, 1.0: 50% full carbon concern)
+
+To create a workload file with binary carbon consideration:
+```bash
+python create_carbon_swf.py --generation_mode binary
+```
+
+This will create `lublin_256_carbon_binary.swf` with an even split between carbon-aware and non-carbon-aware jobs.
+
 ## Install
 
 All necessary packages can be installed with

@@ -16,7 +16,7 @@ def create_carbon_swf(min_val=0.0, max_val=1.0, generation_mode='uniform', const
         min_val: Minimum value for float generation (default: 0.0)
         max_val: Maximum value for float generation (default: 1.0)
         generation_mode: 'uniform' for uniform distribution, 'simple' for simple 3-level distribution,
-                         'constant' to set same value for all jobs
+                         'constant' to set same value for all jobs, 'binary' for 0/1 values
         constant_value: Value to use when generation_mode='constant' (default: 1.0)
     """
     input_file = "./data/lublin_256.swf"
@@ -24,6 +24,8 @@ def create_carbon_swf(min_val=0.0, max_val=1.0, generation_mode='uniform', const
     # Different output files based on generation mode
     if generation_mode == 'simple':
         output_file = "./data/lublin_256_carbon_float_simple.swf"
+    elif generation_mode == 'binary':
+        output_file = "./data/lublin_256_carbon_binary.swf"
     elif generation_mode == 'constant':
         if abs(constant_value - 1.0) < 1e-9:
             output_file = "./data/lublin_256_carbon_all1.swf"
@@ -74,6 +76,38 @@ def create_carbon_swf(min_val=0.0, max_val=1.0, generation_mode='uniform', const
         for level in [0.0, 0.5, 1.0]:
             percentage = (carbon_stats[level] / job_count) * 100
             print(f"  {level:.1f}: {carbon_stats[level]:5d} jobs ({percentage:5.1f}%)")
+    elif generation_mode == 'binary':
+        print("Carbon consideration: BINARY mode with only 0 and 1 values")
+        print("Distribution:")
+        print("  0.0: 50% (no carbon concern)")
+        print("  1.0: 50% (full carbon concern)")
+        
+        job_count = 0
+        carbon_stats = {0.0: 0, 1.0: 0}
+        
+        with open(input_file, 'r') as infile, open(output_file, 'w') as outfile:
+            for line in infile:
+                line = line.strip()
+                
+                # Copy header/comment lines as-is
+                if line.startswith(';') or line == '':
+                    outfile.write(line + '\n')
+                    continue
+                
+                # For job lines, append binary carbon consideration value
+                carbon_value = random.choice([0.0, 1.0])
+                carbon_stats[carbon_value] += 1
+                job_count += 1
+                
+                new_line = line + ' ' + f"{carbon_value:.1f}"
+                outfile.write(new_line + '\n')
+        
+        print(f"\nProcessed {job_count} jobs")
+        print("Actual carbon consideration distribution:")
+        for level in [0.0, 1.0]:
+            percentage = (carbon_stats[level] / job_count) * 100
+            print(f"  {level:.1f}: {carbon_stats[level]:5d} jobs ({percentage:5.1f}%)")
+            
     elif generation_mode == 'constant':
         print(f"Carbon consideration: CONSTANT value set to {constant_value}")
         job_count = 0
@@ -189,8 +223,8 @@ if __name__ == "__main__":
                        help='Minimum value for float generation (default: 0.0)')
     parser.add_argument('--max', type=float, default=1.0,
                        help='Maximum value for float generation (default: 1.0)')
-    parser.add_argument('--generation_mode', choices=['uniform', 'simple', 'constant'], default='uniform',
-                       help='Generation mode: uniform (default), simple (80%% zero, 10%% at 0.5, 10%% at 1.0), or constant (all same)')
+    parser.add_argument('--generation_mode', choices=['uniform', 'simple', 'constant', 'binary'], default='uniform',
+                       help='Generation mode: uniform (default), simple (80%% zero, 10%% at 0.5, 10%% at 1.0), constant (all same), or binary (50%% at 0, 50%% at 1)')
     parser.add_argument('--value', type=float, default=1.0,
                        help='Constant value to use when generation_mode=constant (default: 1.0)')
     
