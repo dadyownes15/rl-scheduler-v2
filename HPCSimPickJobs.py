@@ -206,9 +206,11 @@ class HPCEnv(gym.Env):
             self.episode_start_hour_offset = episode_start_hour_offset
             print("Setting offset manually")
         else:
-            self.episode_start_hour_offset = int(self.np_random.integers(0, max_hours))
-
-            
+            if hasattr(self.np_random, 'integers'):
+                self.episode_start_hour_offset = int(self.np_random.integers(0, max_hours))
+            else:
+                self.episode_start_hour_offset = int(self.np_random.randint(0, max_hours))
+                
         self.cluster.carbonIntensity.setStartOffset(self.episode_start_hour_offset)
         
         if episode_start_hour_offset != None:
@@ -520,8 +522,6 @@ class HPCEnv(gym.Env):
 
 
         green = self.cluster.carbonIntensity.getCarbonIntensitySlot(self.current_timestamp)
-
-        
         carbon_slot = [
             [
                 min(float(carbonSlot['lastTime']) / float(self.loads.max_exec_time), 1.0 - 1e-5),
