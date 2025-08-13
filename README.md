@@ -88,22 +88,34 @@ traj_num = 100
 
 ## Training
 
-### Enhanced Training Interface
+### Training (train.py) – Simple Usage
 
-The training system now supports organized experiments with detailed tracking:
+Train a model with a workload and experiment name:
 
 ```bash
-python MARL.py --workload [str] --backfill [int] --name [str] --description [str]
+python train.py --workload <name> --name <experiment> [--backfill 0|1|2] [--debug] [--description "..."] [--no-score]
 ```
 
-**Required Arguments:**
-- **`--workload`**: Job trace name (lublin_256, Cirne, Jann)
-- **`--name`**: Experiment name (e.g., ED12, baseline, carbon_opt)
+- **workload**: SWF trace name in `data/` (e.g., `lublin_256`)
+- **name**: Experiment name; results saved under `<workload>/MARL_<name>/`
+- **backfill**:
+  - 0 = No backfilling (FCFS/greedy only)
+  - 1 = Green-aware backfilling (queue ordered by carbon-aware score)
+  - 2 = EASY-style backfilling (always allow backfill feasibility check)
 
-**Optional Arguments:**
-- **`--backfill`**: Backfill policy (0=None, 1=Green-backfilling, 2=EASY-backfilling)
-- **`--description`**: Description of the experiment
-- **`--debug`**: Enable debug output
+Examples:
+```bash
+# Baseline without backfilling
+python train.py --workload lublin_256 --backfill 0 --name baseline
+
+# Green-aware backfilling
+python train.py --workload lublin_256 --backfill 1 --name carbon_greedy
+
+# EASY-style backfilling
+python train.py --workload lublin_256 --backfill 2 --name easy_backfill
+```
+
+Note on printed stats: the epoch log prints a line like "Backfill: X% delayed". This is counting delay actions (action2 > 0), not the environment’s backfilling policy. You can run with `--backfill 0` and still see many "delayed" actions if the policy frequently chooses to delay.
 
 ### Experiment Directory Structure
 

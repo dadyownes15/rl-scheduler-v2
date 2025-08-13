@@ -850,7 +850,8 @@ class HPCEnv(gym.Env):
                 next_resource_release_machines = self.running_jobs[0].allocated_machines
 
             next_job_sumbitTime = sys.maxsize
-            if self.next_arriving_job_idx < self.last_job_in_batch:
+            if (self.next_arriving_job_idx < self.last_job_in_batch and 
+                self.next_arriving_job_idx < len(self.loads.all_jobs)):
                 next_job_sumbitTime = self.loads[self.next_arriving_job_idx].submit_time
 
             if skipTime < min(next_job_sumbitTime,next_resource_release_time):
@@ -923,7 +924,7 @@ class HPCEnv(gym.Env):
                          /
                          max(job_for_scheduling.run_time, 10)))
                          
-        return _tmp * (1 - job_for_scheduling.carbon_consideration + BASE_LINE_WAIT_CARBON_PENALITY)
+        return _tmp 
 
     def has_only_one_job(self):
         if len(self.job_queue) == 1:
@@ -1152,7 +1153,8 @@ class HPCEnv(gym.Env):
                 next_resource_release_machines = self.running_jobs[0].allocated_machines
 
             next_job_sumbitTime = sys.maxsize
-            if self.next_arriving_job_idx < self.last_job_in_batch:
+            if (self.next_arriving_job_idx < self.last_job_in_batch and 
+                self.next_arriving_job_idx < len(self.loads.all_jobs)):
                 next_job_sumbitTime = self.loads[self.next_arriving_job_idx].submit_time
 
             nextGreenChange = ((self.current_timestamp // 3600) + 1) * 3600
@@ -1510,6 +1512,96 @@ class HPCEnv(gym.Env):
                 runningJobs.pop(0)  # remove the first running job
 
         return free_processors,CurrentTimestamp
+
+    def fast_forward_to_next_event(self):
+        """
+        Fast-forward simulation time to the next meaningful event:
+        1. Next job arrival
+        2. Next job completion (resource release)
+        3. If jobs are stuck, advance by a small amount to break deadlocks
+        
+        Returns:
+            bool: True if time was advanced, False if no events to advance to
+        """
+        if not hasattr(self, 'running_jobs'):
+            return False
+            
+        next_job_arrival_time = float('inf')
+        next_job_completion_time = float('inf')
+        
+        # Find next job arrival time
+        if (self.next_arriving_job_idx < self.last_job_in_batch and 
+            self.next_arriving_job_idx < len(self.loads.all_jobs)):
+            next_job_arrival_time = self.loads[self.next_arriving_job_idx].submit_time
+        
+        # Find next job completion time
+        if self.running_jobs:
+            self.running_jobs.sort(key=lambda job: (job.scheduled_time + job.run_time))
+            next_job_completion_time = self.running_jobs[0].scheduled_time + self.running_jobs[0].run_time
+        
+        # Choose the earliest event
+        next_event_time = min(next_job_arrival_time, next_job_completion_time)
+        
+        # If no clear next event and we have jobs in queue that can't be scheduled,
+        # try a small time advance to break potential deadlocks
+        if next_event_time == float('inf') or next_event_time <= self.current_timestamp:
+            if len(self.job_queue) > 0:
+                # Advance time by 1 hour to see if situation changes
+                next_event_time = self.current_timestamp + 3600
+                if hasattr(self, 'debug') and self.debug:
+                    print(f"No clear next event, advancing by 1 hour to break potential deadlock")
+            else:
+                return False
+        
+        # Only advance if the next event is in the future
+        if next_event_time > self.current_timestamp:
+            old_time = self.current_timestamp
+            self.current_timestamp = next_event_time
+            self.cluster.PowerStruc.updateCurrentTime(self.current_timestamp)
+            
+            # Process any job completions at this time
+            completed_jobs = []
+            for job in self.running_jobs[:]:  # Create a copy to iterate over
+                if job.scheduled_time + job.run_time <= self.current_timestamp:
+                    completed_jobs.append(job)
+            
+            for job in completed_jobs:
+                self.cluster.release(job.allocated_machines)
+                self.running_jobs.remove(job)
+            
+            # Process any job arrivals at this time
+            while (self.next_arriving_job_idx < self.last_job_in_batch and 
+                   self.next_arriving_job_idx < len(self.loads.all_jobs) and
+                   self.loads[self.next_arriving_job_idx].submit_time <= self.current_timestamp):
+                self.job_queue.append(self.loads[self.next_arriving_job_idx])
+                self.next_arriving_job_idx += 1
+            
+            if hasattr(self, 'debug') and self.debug:
+                print(f"Fast-forwarded from {old_time} to {self.current_timestamp} (delta: {self.current_timestamp - old_time})")
+                if completed_jobs:
+                    print(f"  Completed {len(completed_jobs)} jobs during fast-forward")
+            
+            return True
+        
+        return False
+    
+    def should_terminate_episode(self):
+        """
+        Check if the episode should terminate early.
+        
+        Returns:
+            bool: True if episode should end
+        """
+        # Episode ends if:
+        # 1. No more jobs in queue AND no more jobs arriving AND no running jobs
+        # 2. OR we've reached the end of the job sequence
+        
+        no_jobs_in_queue = len(self.job_queue) == 0
+        no_more_arrivals = (self.next_arriving_job_idx >= self.last_job_in_batch or 
+                           self.next_arriving_job_idx >= len(self.loads.all_jobs))
+        no_running_jobs = len(self.running_jobs) == 0
+        
+        return no_jobs_in_queue and no_more_arrivals and no_running_jobs
 
     def getfitness(self,solution,Temp_power):
         free_processors=self.cluster.free_node * self.cluster.num_procs_per_node

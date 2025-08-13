@@ -16,12 +16,12 @@ import csv
 import numpy as np
 from datetime import datetime
 from HPCSimPickJobs import *
-from MARL import PPO as MARL
+from train import PPO as CCScheduler
 
 
-def load_marl_model(experiment_path, workload_arg=None, epoch=None):
+def load_ccscheduler_model(experiment_path, workload_arg=None, epoch=None):
     """
-    Load MARL model from experiment directory.
+    Load CCScheduler model from experiment directory.
     
     Args:
         experiment_path: Experiment name (e.g., "MARL_basic", "basic") or full path
@@ -29,14 +29,14 @@ def load_marl_model(experiment_path, workload_arg=None, epoch=None):
         epoch: Epoch number to load weights from (if None, loads from final/)
     
     Returns:
-        Loaded MARL model
+        Loaded CCScheduler model
     """
     inputNum_size = [MAX_QUEUE_SIZE, run_win, green_win]
     featureNum_size = [JOB_FEATURES, RUN_FEATURE, GREEN_FEATURE]
     use_cuda = torch.cuda.is_available()
     device = torch.device("cuda" if use_cuda else "cpu")
     
-    model = MARL(batch_size=256, inputNum_size=inputNum_size,
+    model = CCScheduler(batch_size=256, inputNum_size=inputNum_size,
                  featureNum_size=featureNum_size, device=device)
     
     # Auto-detect experiment path if only experiment name is provided
@@ -335,6 +335,18 @@ class EnhancedJobTracker:
             # Convert completion time to datetime
             completion_datetime = self._simulation_time_to_datetime(completion_time)
             
+            # Fix inconsistent state: completed jobs must have been scheduled
+            job_data = self.jobs_data[job_index]
+            if not job_data.get('scheduled', False):
+                estimated_scheduled_time = completion_time - actual_runtime
+                estimated_scheduled_datetime = self._simulation_time_to_datetime(estimated_scheduled_time)
+                job_data.update({
+                    'scheduled_time': estimated_scheduled_time,
+                    'scheduled_datetime': estimated_scheduled_datetime.isoformat() if estimated_scheduled_datetime else None,
+                    'wait_time': estimated_scheduled_time - job_data['submit_time'],
+                    'scheduled': True
+                })
+            
             self.jobs_data[job_index].update({
                 'completion_time': completion_time,
                 'completion_datetime': completion_datetime.isoformat() if completion_datetime else None,
@@ -351,10 +363,26 @@ class EnhancedJobTracker:
         current_time = env.current_timestamp
         
         for job in env.running_jobs:
+            # Ensure all running jobs are tracked as scheduled
+            if job.job_id not in self.job_id_to_index:
+                self.ensure_job_record(job, env, scheduled_only=False)
+            
+            # Fix scheduling status if needed
+            if job.job_id in self.job_id_to_index:
+                job_index = self.job_id_to_index[job.job_id]
+                job_data = self.jobs_data[job_index]
+                if not job_data.get('scheduled', False):
+                    scheduled_datetime = self._simulation_time_to_datetime(job.scheduled_time)
+                    job_data.update({
+                        'scheduled_time': job.scheduled_time,
+                        'scheduled_datetime': scheduled_datetime.isoformat() if scheduled_datetime else None,
+                        'wait_time': job.scheduled_time - job_data['submit_time'],
+                        'scheduled': True
+                    })
+            
             job_end_time = job.scheduled_time + job.request_time
             if job_end_time <= current_time:
-                # Job should be completed by now
-                actual_runtime = job.request_time  # In simulation, actual = requested
+                actual_runtime = job.request_time
                 self.update_job_completion(job.job_id, job_end_time, actual_runtime)
     
     def finalize_remaining_jobs(self, env):
@@ -385,7 +413,40 @@ class EnhancedJobTracker:
         """
         # Check if job is already tracked
         if job.job_id in self.job_id_to_index:
-            return  # Already recorded, nothing to do
+            # Job already exists - check if we need to update missing carbon metrics
+            job_index = self.job_id_to_index[job.job_id]
+            job_data = self.jobs_data[job_index]
+            
+            # Check if job was scheduled since we last saw it
+            was_scheduled = hasattr(job, 'scheduled_time') and job.scheduled_time != -1
+            
+            # If job is now scheduled but we're missing carbon metrics, calculate them
+            if (was_scheduled and job_data.get('scheduled', False) and 
+                hasattr(self, 'carbon_intensity') and 
+                (job_data.get('carbon_emissions') is None or 
+                 job_data.get('carbon_reward') is None)):
+                
+                try:
+                    # Calculate missing carbon emissions
+                    if job_data.get('carbon_emissions') is None:
+                        carbon_emissions = self.carbon_intensity.getCarbonEmissions(
+                            job.power, job.scheduled_time, job.scheduled_time + job.request_time
+                        )
+                        job_data['carbon_emissions'] = carbon_emissions
+                    
+                    # Calculate missing carbon reward
+                    if job_data.get('carbon_reward') is None:
+                        carbon_reward = self.carbon_intensity.getCarbonAwareReward([job])
+                        job_data['carbon_reward'] = carbon_reward
+                        
+                except Exception as e:
+                    # Fallback to 0 values if calculation fails
+                    if job_data.get('carbon_emissions') is None:
+                        job_data['carbon_emissions'] = 0.0
+                    if job_data.get('carbon_reward') is None:
+                        job_data['carbon_reward'] = 0.0
+            
+            return  # Already recorded, updates done if needed
         
         # Check if job was scheduled
         was_scheduled = hasattr(job, 'scheduled_time') and job.scheduled_time != -1
@@ -454,8 +515,56 @@ class EnhancedJobTracker:
         self.jobs_data.append(job_info)
         self.job_id_to_index[job.job_id] = job_index
 
+    def validate_job_consistency(self):
+        """
+        Validate and fix job state consistency.
+        CRITICAL: Jobs cannot be completed without first being scheduled.
+        """
+        inconsistent_jobs = []
+        fixed_jobs = []
+        
+        for i, job_data in enumerate(self.jobs_data):
+            job_id = job_data.get('job_id', f'unknown_{i}')
+            scheduled = job_data.get('scheduled', False)
+            completed = job_data.get('completed', False)
+            
+            # Check for impossible state: completed but not scheduled
+            if completed and not scheduled:
+                inconsistent_jobs.append(job_id)
+                
+                # Auto-fix: If completed, must have been scheduled
+                
+                # Estimate scheduling time from completion data
+                completion_time = job_data.get('completion_time')
+                actual_runtime = job_data.get('actual_runtime')
+                submit_time = job_data.get('submit_time')
+                
+                if completion_time and actual_runtime:
+                    estimated_scheduled_time = completion_time - actual_runtime
+                    estimated_scheduled_datetime = self._simulation_time_to_datetime(estimated_scheduled_time)
+                    
+                    # Update job data with corrected scheduling info
+                    job_data.update({
+                        'scheduled_time': estimated_scheduled_time,
+                        'scheduled_datetime': estimated_scheduled_datetime.isoformat() if estimated_scheduled_datetime else None,
+                        'wait_time': estimated_scheduled_time - submit_time if submit_time else None,
+                        'scheduled': True
+                    })
+                    fixed_jobs.append(job_id)
+                else:
+                    # Fallback: Just mark as scheduled without timing details
+                    job_data['scheduled'] = True
+                    fixed_jobs.append(job_id)
+        
+        # Silently fix inconsistencies
+        
+        return len(inconsistent_jobs), len(fixed_jobs)
+
     def record_episode_summary(self, episode_num, total_reward, green_reward, jobs_completed, makespan):
         """Record episode-level summary"""
+        # Validate job consistency before recording summary
+        inconsistencies, fixes = self.validate_job_consistency()
+        
         completed_jobs = [j for j in self.jobs_data if j['completed']]
         avg_wait_time = np.mean([j['wait_time'] for j in completed_jobs if j['wait_time'] is not None])
         
@@ -467,16 +576,18 @@ class EnhancedJobTracker:
             'jobs_scheduled': len([j for j in self.jobs_data if j['scheduled']]),
             'jobs_actually_completed': len(completed_jobs),
             'makespan': makespan,
-            'avg_wait_time': avg_wait_time
+            'avg_wait_time': avg_wait_time,
+            'consistency_issues_found': inconsistencies,
+            'consistency_issues_fixed': fixes
         })
 
 
-def run_enhanced_marl_validation(model, env, tracker, episode_num):
+def run_enhanced_ccscheduler_validation(model, env, tracker, episode_num):
     """
-    Run a single validation episode with enhanced tracking.
+    Run a single validation episode with enhanced tracking and event-driven optimization.
     
     Args:
-        model: Loaded MARL model
+        model: Loaded CCScheduler model
         env: HPC environment
         tracker: EnhancedJobTracker instance
         episode_num: Episode number for tracking
@@ -497,6 +608,8 @@ def run_enhanced_marl_validation(model, env, tracker, episode_num):
     print(f"  Starting episode {episode_num}, initial queue size: {len(env.job_queue)}")
     
     step_count = 0
+    no_action_count = 0  # Track consecutive steps with no valid actions
+    
     while True:
         step_count += 1
         
@@ -511,24 +624,48 @@ def run_enhanced_marl_validation(model, env, tracker, episode_num):
                 )
                 job_indices[job] = job_idx
         
-        # Build action mask (same logic as compare.py)
+        # Build action mask using the same logic as the environment's step() function
+        # The key insight: check env.pairs directly, not try to parse observation features
         lst = []
-        for i in range(0, MAX_QUEUE_SIZE * JOB_FEATURES, JOB_FEATURES):
-            job_slice = o[i:i + JOB_FEATURES]
-            # Check for padding patterns
-            padding_pattern1 = [0] + [1] * (JOB_FEATURES - 2) + [0]
-            padding_pattern2 = [1] * JOB_FEATURES
-            
-            if (len(job_slice) == len(padding_pattern1) and 
-                all(abs(job_slice[j] - padding_pattern1[j]) < 1e-6 for j in range(len(job_slice)))):
-                lst.append(1)  # Mask out (invalid)
-            elif (len(job_slice) == len(padding_pattern2) and 
-                  all(abs(job_slice[j] - padding_pattern2[j]) < 1e-6 for j in range(len(job_slice)))):
-                lst.append(1)  # Mask out (invalid)
-            else:
+        for i in range(MAX_QUEUE_SIZE):
+            if i < len(env.pairs) and env.pairs[i][0] is not None:
                 lst.append(0)  # Valid job
+            else:
+                lst.append(1)  # Invalid/padding
         
-        # Action 2 mask
+        # Check if we have any valid actions
+        valid_jobs_count = lst.count(0)
+        
+        # OPTIMIZATION: Check for episode termination conditions
+        # The key insight: episodes should end when we've processed all jobs in the batch,
+        # not just when the job queue is empty at a single moment
+        
+        # Check if we've reached the end of the job batch
+        if (env.next_arriving_job_idx >= env.last_job_in_batch and 
+            len(env.job_queue) == 0 and 
+            len(env.running_jobs) == 0):
+            print(f"    Episode completed: all jobs processed")
+            jobs_completed = step_count
+            break
+        
+        # Check if we have any valid jobs to work with
+        if valid_jobs_count == 0 and len(env.job_queue) == 0:
+            no_action_count += 1
+            # If no jobs available, try to fast-forward to get more jobs
+            if env.fast_forward_to_next_event():
+                # Update observation after fast-forwarding
+                o = env.build_observation()
+                no_action_count = 0  # Reset counter
+                print(f"    Fast-forwarded to time {env.current_timestamp}, queue: {len(env.job_queue)}, running: {len(env.running_jobs)}")
+                continue
+            elif no_action_count > 5:  # If fast-forward didn't help for several steps
+                print(f"    Episode terminating: no more jobs available")
+                jobs_completed = step_count
+                break
+        else:
+            no_action_count = 0  # Reset counter when we have jobs
+        
+        # Action 2 mask - use the same logic as memory
         mask2 = np.zeros(action2_num, dtype=int)
         if running_num < delayMaxJobNum:
             mask2[running_num + 1:delayMaxJobNum + 1] = 1
@@ -558,12 +695,30 @@ def run_enhanced_marl_validation(model, env, tracker, episode_num):
         total_reward += r
         green_reward += greenRwd
         
+        # Check for episode completion (from environment or custom logic)
         if d:
             jobs_completed = step_count
             break
+            
+        # Additional termination check for delay-heavy episodes
+        # If we've processed all jobs and queue is empty, episode should end
+        if (env.next_arriving_job_idx >= env.last_job_in_batch and 
+            len(env.job_queue) == 0):
+            # Even if some jobs are still running, we can end the episode
+            # since no more scheduling decisions are needed
+            print(f"    Episode terminating: all jobs from batch processed")
+            jobs_completed = step_count
+            break
         
-        if step_count % 100 == 0:
-            print(f"    Step {step_count}, queue size: {len(env.job_queue)}, running: {running_num}")
+        # More frequent progress reporting for long episodes
+        if step_count % 50 == 0:
+            print(f"    Step {step_count}, queue size: {len(env.job_queue)}, running: {running_num}, time: {env.current_timestamp}")
+        
+        # Safety break for infinite loops
+        if step_count > 50000:
+            print(f"    WARNING: Episode {episode_num} exceeded 50k steps, forcing termination")
+            jobs_completed = step_count
+            break
     
     # Finalize remaining jobs at episode end
     tracker.finalize_remaining_jobs(env)
@@ -597,6 +752,9 @@ def run_enhanced_marl_validation(model, env, tracker, episode_num):
 
 def save_enhanced_validation_results(tracker, experiment_path, workload, episodes, epoch=None):
     """Save enhanced validation results with comprehensive job completion data"""
+    
+    # Final validation and fix any inconsistencies
+    tracker.validate_job_consistency()
     
     # Create validation results directory with epoch subfolder
     if epoch is not None:
@@ -633,14 +791,30 @@ def save_enhanced_validation_results(tracker, experiment_path, workload, episode
             print(f"    Mean: {carbon_values.mean():.3f}")
             print(f"    Std: {carbon_values.std():.3f}")
             
-            # Show distribution in bins
+            # Show distribution in bins with wait time analysis
             bins = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
             bin_labels = ["0.0-0.2", "0.2-0.4", "0.4-0.6", "0.6-0.8", "0.8-1.0"]
+            
+            # Check if we have wait_time data for analysis
+            has_wait_time = 'wait_time' in scheduled_jobs.columns and not scheduled_jobs['wait_time'].isna().all()
+            
             for i, (low, high) in enumerate(zip(bins[:-1], bins[1:])):
-                count = len(carbon_values[(carbon_values >= low) & (carbon_values < high)])
                 if i == len(bins) - 2:  # Last bin, include upper bound
-                    count = len(carbon_values[(carbon_values >= low) & (carbon_values <= high)])
-                print(f"    {bin_labels[i]}: {count} jobs ({count/len(scheduled_jobs)*100:.1f}%)")
+                    bin_mask = (carbon_values >= low) & (carbon_values <= high)
+                else:
+                    bin_mask = (carbon_values >= low) & (carbon_values < high)
+                
+                count = len(carbon_values[bin_mask])
+                percentage = count/len(scheduled_jobs)*100 if len(scheduled_jobs) > 0 else 0
+                
+                if has_wait_time and count > 0:
+                    # Calculate average wait time for this carbon consideration bin
+                    bin_jobs = scheduled_jobs[bin_mask]
+                    avg_wait_time = bin_jobs['wait_time'].mean()
+                    avg_wait_hours = avg_wait_time / 3600.0  # Convert seconds to hours
+                    print(f"    {bin_labels[i]}: {count} jobs ({percentage:.1f}%) - Avg wait: {avg_wait_hours:.2f}h")
+                else:
+                    print(f"    {bin_labels[i]}: {count} jobs ({percentage:.1f}%)")
         
         if len(completed_jobs) > 0:
             # Carbon emissions analysis
@@ -733,7 +907,7 @@ def main():
     """Enhanced main function with improved job tracking"""
     import argparse
     
-    parser = argparse.ArgumentParser(description='Enhanced MARL Validation with Comprehensive Job Tracking')
+    parser = argparse.ArgumentParser(description='Enhanced CCScheduler Validation with Comprehensive Job Tracking')
     parser.add_argument('--experiment', required=True, help='Experiment name (e.g., MARL_basic, basic) or full path')
     parser.add_argument('--workload', required=True, help='Workload name (e.g., lublin_256_carbon_float) or file path (e.g., ./data/lublin_256_carbon_float.swf)')
     parser.add_argument('--epoch', type=int, help='Epoch number to load weights from (if not specified, loads from final/)')
@@ -747,7 +921,7 @@ def main():
     args = parser.parse_args()
     
     print("=" * 80)
-    print("ENHANCED MARL VALIDATION WITH COMPREHENSIVE JOB TRACKING")
+    print("ENHANCED CCSCHEDULER VALIDATION WITH COMPREHENSIVE JOB TRACKING")
     print("=" * 80)
     print(f"Experiment: {args.experiment}")
     print(f"Workload: {args.workload}")
@@ -766,8 +940,8 @@ def main():
     torch.manual_seed(args.seed)
     
     # Load model
-    print("Loading MARL model...")
-    model = load_marl_model(args.experiment, args.workload, args.epoch)
+    print("Loading CCScheduler model...")
+    model = load_ccscheduler_model(args.experiment, args.workload, args.epoch)
     print("✓ Model loaded successfully")
     
     # Initialize environment
@@ -792,7 +966,7 @@ def main():
     print(f"Overriding job sequence size from {original_job_sequence_size} to {args.jobs_per_episode} for validation")
     
     # We need to override this during each episode reset, not here
-    # Store the desired size for use in run_enhanced_marl_validation
+    # Store the desired size for use in run_enhanced_ccscheduler_validation
     env._validation_job_sequence_size = args.jobs_per_episode
     
     print("✓ Environment initialized")
@@ -814,14 +988,26 @@ def main():
         
         env.reset()
         
-        # Override job sequence size for this episode
+        # Override job sequence size for this episode with bounds checking
         if hasattr(env, '_validation_job_sequence_size'):
             original_batch_size = env.num_job_in_batch
-            env.num_job_in_batch = env._validation_job_sequence_size
+            
+            # Calculate maximum jobs available from current start position
+            max_jobs_available = len(env.loads.all_jobs) - env.start
+            
+            # Use the smaller of requested jobs or available jobs
+            actual_job_count = min(env._validation_job_sequence_size, max_jobs_available)
+            
+            env.num_job_in_batch = actual_job_count
             env.last_job_in_batch = env.start + env.num_job_in_batch
+            
+            if actual_job_count < env._validation_job_sequence_size:
+                print(f"  WARNING: Requested {env._validation_job_sequence_size} jobs but only {max_jobs_available} available from start position {env.start}")
+                print(f"  Using {actual_job_count} jobs instead to prevent bounds errors")
+            
             print(f"  Overrode episode job count from {original_batch_size} to {env.num_job_in_batch}")
         
-        total_reward, green_reward, jobs_completed = run_enhanced_marl_validation(
+        total_reward, green_reward, jobs_completed = run_enhanced_ccscheduler_validation(
             model, env, episode_tracker, episode + 1
         )
         

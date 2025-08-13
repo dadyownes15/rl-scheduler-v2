@@ -8,20 +8,27 @@ import random
 import os
 import argparse
 
-def create_carbon_swf(min_val=0.0, max_val=1.0, generation_mode='uniform'):
+def create_carbon_swf(min_val=0.0, max_val=1.0, generation_mode='uniform', constant_value=1.0):
     """
     Read lublin_256.swf and create lublin_256_carbon.swf with float carbon consideration values
     
     Args:
         min_val: Minimum value for float generation (default: 0.0)
         max_val: Maximum value for float generation (default: 1.0)
-        generation_mode: 'uniform' for uniform distribution, 'simple' for simple 3-level distribution
+        generation_mode: 'uniform' for uniform distribution, 'simple' for simple 3-level distribution,
+                         'constant' to set same value for all jobs
+        constant_value: Value to use when generation_mode='constant' (default: 1.0)
     """
     input_file = "./data/lublin_256.swf"
     
     # Different output files based on generation mode
     if generation_mode == 'simple':
         output_file = "./data/lublin_256_carbon_float_simple.swf"
+    elif generation_mode == 'constant':
+        if abs(constant_value - 1.0) < 1e-9:
+            output_file = "./data/lublin_256_carbon_all1.swf"
+        else:
+            output_file = f"./data/lublin_256_carbon_const_{constant_value:.3f}.swf"
     else:
         output_file = "./data/lublin_256_carbon_float.swf"
     
@@ -67,6 +74,21 @@ def create_carbon_swf(min_val=0.0, max_val=1.0, generation_mode='uniform'):
         for level in [0.0, 0.5, 1.0]:
             percentage = (carbon_stats[level] / job_count) * 100
             print(f"  {level:.1f}: {carbon_stats[level]:5d} jobs ({percentage:5.1f}%)")
+    elif generation_mode == 'constant':
+        print(f"Carbon consideration: CONSTANT value set to {constant_value}")
+        job_count = 0
+        with open(input_file, 'r') as infile, open(output_file, 'w') as outfile:
+            for line in infile:
+                line = line.strip()
+                # Copy header/comment lines as-is
+                if line.startswith(';') or line == '':
+                    outfile.write(line + '\n')
+                    continue
+                # For job lines, append constant carbon consideration value
+                new_line = line + ' ' + f"{float(constant_value):.6f}"
+                outfile.write(new_line + '\n')
+                job_count += 1
+        print(f"\nProcessed {job_count} jobs")
     else:
         print(f"Carbon consideration: FLOAT values uniformly distributed between {min_val} and {max_val}")
         
@@ -167,8 +189,10 @@ if __name__ == "__main__":
                        help='Minimum value for float generation (default: 0.0)')
     parser.add_argument('--max', type=float, default=1.0,
                        help='Maximum value for float generation (default: 1.0)')
-    parser.add_argument('--generation_mode', choices=['uniform', 'simple'], default='uniform',
-                       help='Generation mode: uniform (default) or simple (80%% zero, 10%% at 0.5, 10%% at 1.0)')
+    parser.add_argument('--generation_mode', choices=['uniform', 'simple', 'constant'], default='uniform',
+                       help='Generation mode: uniform (default), simple (80%% zero, 10%% at 0.5, 10%% at 1.0), or constant (all same)')
+    parser.add_argument('--value', type=float, default=1.0,
+                       help='Constant value to use when generation_mode=constant (default: 1.0)')
     
     args = parser.parse_args()
     
@@ -176,14 +200,17 @@ if __name__ == "__main__":
     print("=" * 50)
     
     # Validate arguments
-    if args.min >= args.max:
-        print("ERROR: --min must be less than --max")
+    if args.generation_mode == 'uniform' and args.min >= args.max:
+        print("ERROR: --min must be less than --max for uniform mode")
         exit(1)
     
     # For simple mode, ignore min/max values
     if args.generation_mode == 'simple':
         if args.min != 0.0 or args.max != 1.0:
             print("Note: Simple mode uses fixed values (0.0, 0.5, 1.0), ignoring --min and --max")
+    if args.generation_mode == 'constant':
+        if args.min != 0.0 or args.max != 1.0:
+            print("Note: Constant mode ignores --min and --max; using --value for all jobs")
     
     # Check if input file exists
     if not os.path.exists("./data/lublin_256.swf"):
@@ -191,7 +218,7 @@ if __name__ == "__main__":
         exit(1)
     
     # Create the new SWF file
-    output_file = create_carbon_swf(min_val=args.min, max_val=args.max, generation_mode=args.generation_mode)
+    output_file = create_carbon_swf(min_val=args.min, max_val=args.max, generation_mode=args.generation_mode, constant_value=args.value)
     
     # Verify the created file
     if verify_carbon_swf(output_file, generation_mode=args.generation_mode):

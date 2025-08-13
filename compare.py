@@ -3,13 +3,8 @@ import os
 import random
 import torch
 from HPCSimPickJobs import *
-
-
-from MaskablePPO import PPO
-from MaskablePPO_Carbon import PPO as PPO_Carbon
 from GA import GA
-from  MARL import PPO as MARL
-# from  MARL_Plus import PPO as MARL_Plus
+from  train import PPO as MARL
 
 
 def column_averages(matrix):
@@ -161,6 +156,7 @@ def run_policy(env, nums, iters):
         start = start_list[iter_num]
         env.reset_for_test(nums, start)
 
+        """
         log,greenRwd=env.schedule_curr_sequence_reset(env.fcfs_score)
         reward1=sum(log.values())
         fcfs_r.append([reward1,greenRwd,eta*reward1+greenRwd])
@@ -176,17 +172,7 @@ def run_policy(env, nums, iters):
         reward1, greenRwd = GA_policy(env,eta=eta)
         GA_r.append([reward1, greenRwd, eta*reward1+greenRwd])
         env.reset_for_test(nums, start)
-
-        model=load_policy('PPO', PPO_path)
-        reward1, greenRwd=RL_OneAction(model,env)
-        PPO_r.append([-reward1,greenRwd,eta*reward1+greenRwd])
-        env.reset_for_test(nums, start)
-
-        model=load_policy('PPO_Carbon', PPO_Carbon_path)
-        reward1, greenRwd=RL_OneAction(model,env)
-        PPO_Carbon_r.append([-reward1,greenRwd,eta*reward1+greenRwd])
-        env.reset_for_test(nums, start)
-
+        """
         model=load_policy('MARL', MARL_path)
         reward1, greenRwd=RL_MultiAction(model,env)
         MARL_r.append([-reward1,greenRwd,eta*reward1+greenRwd])

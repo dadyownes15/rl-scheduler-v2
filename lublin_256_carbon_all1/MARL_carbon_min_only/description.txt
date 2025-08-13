@@ -1,0 +1,4 @@
+Experiment: MARL_carbon_min_only
+Workload: lublin_256_carbon_all1
+Timestamp: 2025-08-12 12:08:01
+Description: Optimize for minimal carbon output only  without backfilling
