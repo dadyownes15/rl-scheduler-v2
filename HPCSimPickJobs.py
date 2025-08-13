@@ -94,21 +94,6 @@ class HPCEnv(gym.Env):
         self.loads = Workloads(workload_file)
         self.cluster = Cluster("Cluster", self.loads.max_nodes, self.loads.max_procs / self.loads.max_nodes, processor_per_machine, idlePower, green_win, year=carbon_year)
         
-        # Initialize carbon intensity sampler for curriculum learning
-        from carbon_sampler import CarbonSampler
-        self.sampler = CarbonSampler.from_csv(
-            csv_path="data/DK-DK2_hourly_carbon_intensity_noFeb29.csv",
-            year=carbon_year,
-            horizon=green_win
-        )
-        
-        if self.debug:
-            stats = self.sampler.get_stats()
-            print(f"Carbon sampler initialized:")
-            print(f"  Mean intensity: {stats['mean']:.2f} gCO2eq/kWh")
-            print(f"  Std deviation: {stats['std']:.2f} gCO2eq/kWh")
-            print(f"  Range: {stats['min']:.2f} - {stats['max']:.2f} gCO2eq/kWh")
-            print(f"  Data points: {stats['length']}")
         
         # Verification: Check that environment is properly initialized with carbon-aware components
         if self.debug:
@@ -210,41 +195,25 @@ class HPCEnv(gym.Env):
         return total_score
 
     # @profile
-    def reset(self):
+    def reset(self, episode_start_hour_offset = None):
         self.cluster.reset()
         self.loads.reset()
 
-        # ---------- curriculum-driven carbon profile selection ----------
-        if self.sampler is not None:
-            # Sample carbon profile based on curriculum parameter
-            self.carbon_profile = self.sampler.sample(self.curriculum_tau)
-            
-            # Instead of overriding the full list, extend the curriculum profile to cover the full year
-            # This ensures carbon reward calculations that might look beyond the window still work
-            full_year_hours = len(self.cluster.carbonIntensity.carbonIntensityList)
-            extended_profile = []
-            
-            # Tile the curriculum profile to cover a full year
-            profile_length = len(self.carbon_profile)
-            for hour in range(full_year_hours):
-                extended_profile.append(self.carbon_profile[hour % profile_length])
-            
-            # Override the cluster's carbon intensity with extended curriculum profile
-            self.cluster.carbonIntensity.carbonIntensityList = extended_profile
-            
-            # Reset start offset to 0 since we're using our own profile
-            self.cluster.carbonIntensity.setStartOffset(0)
-            
+        # Fallback to original random offset behavior
+        max_hours = len(self.cluster.carbonIntensity.carbonIntensityList)
 
+        if episode_start_hour_offset != None:
+            self.episode_start_hour_offset = episode_start_hour_offset
+            print("Setting offset manually")
         else:
-            # Fallback to original random offset behavior
-            max_hours = len(self.cluster.carbonIntensity.carbonIntensityList)
-            if hasattr(self.np_random, 'integers'):
-                self.episode_start_hour_offset = int(self.np_random.integers(0, max_hours))
-            else:
-                self.episode_start_hour_offset = int(self.np_random.randint(0, max_hours))
-            self.cluster.carbonIntensity.setStartOffset(self.episode_start_hour_offset)
-        # ---------------------------------------------------------------
+            self.episode_start_hour_offset = int(self.np_random.integers(0, max_hours))
+
+            
+        self.cluster.carbonIntensity.setStartOffset(self.episode_start_hour_offset)
+        
+        if episode_start_hour_offset != None:
+            assert(self.cluster.carbonIntensity.start_offset == episode_start_hour_offset)
+    # ---------------------------------------------------------------
 
         self.job_queue = []
         self.running_jobs = []
@@ -551,6 +520,8 @@ class HPCEnv(gym.Env):
 
 
         green = self.cluster.carbonIntensity.getCarbonIntensitySlot(self.current_timestamp)
+
+        
         carbon_slot = [
             [
                 min(float(carbonSlot['lastTime']) / float(self.loads.max_exec_time), 1.0 - 1e-5),

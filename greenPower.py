@@ -37,6 +37,15 @@ class carbon_intensity():
         """Shift the carbon-intensity timeline by <offset_hours> (0-8759)."""
         self.start_offset = offset_hours % len(self.carbonIntensityList)
     
+    def getCurrentIntensity(self, hours_after_sim_start):
+        # Takes an hour, expected to be N hours after simulation start. If it exceeds the list, it loops to the front.
+
+        # We use hours_after_sim_start + offset, to get the hour index, and we use % len(carbonList) because we only use a years data, and have to ensure that we do not go out of bond
+        hour_index = (hours_after_sim_start + self.start_offset) % len(self.carbonIntensityList)
+        
+        return self.carbonIntensityList[hour_index]
+            
+
     def loadCarbonIntensityData(self):
         """Load carbon intensity data from CSV file"""
         current_dir = os.getcwd()
@@ -63,11 +72,15 @@ class carbon_intensity():
         carbonSlot = []
         index = int(currentTime / 3600)  # Current hour index
         t = currentTime
-        
+         
+
         for i in range(index, index + self.greenWin):
             # Handle wrap-around for year-long data with start offset
             hour_index = (i + self.start_offset) % len(self.carbonIntensityList)
+            
             carbonIntensity = self.carbonIntensityList[hour_index]
+
+           #  print("Hour index (included offset)", hour_index, "Carbon intensity at hour index: ", carbonIntensity)
             lastTime = (i + 1) * 3600 - t
             carbonSlot.append({'lastTime': lastTime, 'carbonIntensity': carbonIntensity})
             t = (i + 1) * 3600
@@ -610,3 +623,4 @@ class carbon_intensity():
             'weighted_emissions': total_weighted_emissions,
             'per_job_metrics': per_job_metrics
         }
+    
