@@ -35,6 +35,19 @@ def _try_import_validation():
 
 from HPCSimPickJobs import *
 
+# Check and print device information
+use_cuda = torch.cuda.is_available()
+device = torch.device("cuda" if use_cuda else "cpu")
+print("\n" + "="*50)
+print("TRAINING DEVICE INFORMATION:")
+print(f"CUDA Available: {use_cuda}")
+print(f"Using Device: {device}")
+if use_cuda:
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"Current CUDA device: {torch.cuda.current_device()}")
+    print(f"Number of GPUs available: {torch.cuda.device_count()}")
+print("="*50 + "\n")
+
 class PerStepRewardCalculator:
     """
     Configurable per-step reward calculator that can use different reward functions.

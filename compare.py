@@ -24,6 +24,13 @@ def load_policy(modelName,model_path):
     featureNum_size = [JOB_FEATURES, RUN_FEATURE, GREEN_FEATURE]
     use_cuda = torch.cuda.is_available()
     device = torch.device("cuda" if use_cuda else "cpu")
+    print("\n" + "="*50)
+    print(f"DEVICE INFO:")
+    print(f"CUDA Available: {use_cuda}")
+    print(f"Using Device: {device}")
+    if use_cuda:
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print("="*50 + "\n")
 
     if modelName=='MARL':
         model = MARL(batch_size=256, inputNum_size=inputNum_size,
