@@ -35,6 +35,65 @@ def _try_import_validation():
 
 from HPCSimPickJobs import *
 
+# Helper to reconstruct 3D state tensor from new 1D observation
+def reconstruct_state_tensor(o, device=None):
+    """
+    Convert 1D observation of length:
+      7*MAX_QUEUE_SIZE + RUN_FEATURE*run_win + (green_win + 8)
+    into a [1, MAX_QUEUE_SIZE + run_win + green_rows, JOB_FEATURES] tensor by:
+      - jobs: already 7-wide rows
+      - runs: RUN_FEATURE-wide rows padded to 7
+      - green: (green_win+8) scalars chunked into green_rows rows of width 7
+        where green_rows = ceil((green_win + 8) / JOB_FEATURES)
+    """
+    import numpy as _np
+    import torch as _torch
+
+    # Compute green_rows without importing math
+    green_rows = (green_win + 8 + JOB_FEATURES - 1) // JOB_FEATURES
+
+    # Expected flattened 1D length from the environment
+    total_expected = MAX_QUEUE_SIZE * JOB_FEATURES + run_win * RUN_FEATURE + (green_win + 8)
+
+    # Accept list or numpy array and flatten
+    arr = _np.array(o, dtype=_np.float32).reshape(-1)
+
+    # Also accept already 3D-packed shape (rare), convert directly
+    if arr.size == (MAX_QUEUE_SIZE + run_win + green_rows) * JOB_FEATURES:
+        tensor = _torch.FloatTensor(arr.reshape(1, MAX_QUEUE_SIZE + run_win + green_rows, JOB_FEATURES))
+        return tensor.to(device) if device is not None else tensor
+
+    assert arr.size == total_expected, f"Unexpected observation length {arr.size}, expected {total_expected}"
+
+    # Split 1D into segments
+    q_len = MAX_QUEUE_SIZE * JOB_FEATURES
+    r_len = run_win * RUN_FEATURE
+    g_len = (green_win + 8)  # unified green is pure 1D, independent of JOB_FEATURES
+
+    # 1) jobs: already 7-wide rows
+    job = arr[:q_len].reshape(MAX_QUEUE_SIZE, JOB_FEATURES)
+
+    # 2) runs: RUN_FEATURE-wide rows -> pad to 7
+    if r_len > 0:
+        run = arr[q_len:q_len + r_len].reshape(run_win, RUN_FEATURE)
+    else:
+        run = _np.zeros((0, RUN_FEATURE), dtype=_np.float32)
+    run_padded = _np.zeros((run_win, JOB_FEATURES), dtype=_np.float32)
+    if run_win > 0 and RUN_FEATURE > 0:
+        run_padded[:, :RUN_FEATURE] = run
+
+    # 3) green: 1D vector of (green_win+8) scalars -> chunk to 7-wide rows, pad last row with zeros as needed
+    green_1d = arr[q_len + r_len:q_len + r_len + g_len]
+    # pad to full rows
+    pad_needed = green_rows * JOB_FEATURES - green_1d.size
+    if pad_needed > 0:
+        green_1d = _np.concatenate([green_1d, _np.zeros(pad_needed, dtype=_np.float32)], axis=0)
+    green = green_1d.reshape(green_rows, JOB_FEATURES)
+
+    combined = _np.vstack([job, run_padded, green]).reshape(1, MAX_QUEUE_SIZE + run_win + green_rows, JOB_FEATURES)
+    tensor = _torch.FloatTensor(combined)
+    return tensor.to(device) if device is not None else tensor
+
 # Check and print device information
 use_cuda = torch.cuda.is_available()
 device = torch.device("cuda" if use_cuda else "cpu")
@@ -1110,14 +1169,13 @@ class PPO():
 
     def load_using_model_name(self, model_name_path):
         self.actor_net.load_state_dict(
-            torch.load(model_name_path + "_actor.pkl"))
+            torch.load(model_name_path + "_actor.pkl", map_location=device))
         self.critic_net.load_state_dict(
-            torch.load(model_name_path + "_critic.pkl"))
+            torch.load(model_name_path + "_critic.pkl", map_location=device))
 
     def eval_action(self,o,mask1,mask2):
         with torch.no_grad():
-            o = o.reshape(1, MAX_QUEUE_SIZE + run_win + green_win, JOB_FEATURES)
-            state = torch.FloatTensor(o).to(self.device)
+            state = reconstruct_state_tensor(o, device=self.device)
             mask1 = np.array(mask1).reshape(1, MAX_QUEUE_SIZE)
             mask1 = torch.FloatTensor(mask1).to(self.device)
             mask2 = mask2.reshape(1, action2_num)
@@ -1602,7 +1660,9 @@ def train(workload, backfill, debug=False, experiment_name="", description="", n
     if debug:
         print(f"  Using eta: {eta}")
         
-    inputNum_size    = [MAX_QUEUE_SIZE, run_win, green_win]       # grid dims
+    # For unified green vector (forecast+context), derive green_rows = ceil((green_win+8)/JOB_FEATURES)
+    green_rows = (green_win + 8 + JOB_FEATURES - 1) // JOB_FEATURES
+    inputNum_size    = [MAX_QUEUE_SIZE, run_win, green_rows]       # grid dims
     featureNum_size  = [JOB_FEATURES,   RUN_FEATURE, GREEN_FEATURE]
     
     # Read batch_size from config if available
@@ -1688,8 +1748,7 @@ def train(workload, backfill, debug=False, experiment_name="", description="", n
             # 5-b. State → tensor; ask PPO for an action
             # ----------------------------------------------------------
             with torch.no_grad():                            # inference only
-                o_reshaped = o.reshape(1, MAX_QUEUE_SIZE + run_win + green_win, JOB_FEATURES)
-                state  = torch.FloatTensor(o_reshaped).to(device)
+                state = reconstruct_state_tensor(o, device=device)
                 mask1T = torch.FloatTensor(np.array(lst).reshape(1, MAX_QUEUE_SIZE)).to(device)
                 mask2T = torch.FloatTensor(mask2.reshape(1, action2_num)).to(device)
                 

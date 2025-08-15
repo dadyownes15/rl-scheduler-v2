@@ -9,6 +9,7 @@ from gym import spaces
 from gym.utils import seeding
 import configparser
 from greenPower import MAX_CARBON_INTENSITY
+import math
 
 config = configparser.ConfigParser()
 config.read('configFile/config.ini')
@@ -57,8 +58,13 @@ class HPCEnv(gym.Env):
         print("Initialize Simple HPC Env")
 
         self.action_space = spaces.Discrete(MAX_QUEUE_SIZE)
+        # Observation vector length:
+        # jobs: JOB_FEATURES * MAX_QUEUE_SIZE
+        # runs: RUN_FEATURE * run_win
+        # green unified vector (forecast + context): (green_win + 8) scalars, independent of JOB_FEATURES
+        obs_len = JOB_FEATURES * MAX_QUEUE_SIZE + RUN_FEATURE * run_win + (green_win + 8)
         self.observation_space = spaces.Box(low=0.0, high=1.0,
-                                            shape=(JOB_FEATURES * MAX_QUEUE_SIZE,),
+                                            shape=(obs_len,),
                                             dtype=np.float32)
 
         self.job_queue = []
@@ -472,71 +478,91 @@ class HPCEnv(gym.Env):
         return scheduled_logs,carbonRwd
 
     def build_observation(self):
-        vector = np.zeros((MAX_QUEUE_SIZE + run_win + green_win) * JOB_FEATURES, dtype=float)
+        """
+        Build observation as a flat vector:
+        - Queue: 7 features per job (JOB_FEATURES)
+        - Running: RUN_FEATURE (=2) per running job, padded to run_win
+        - Green unified vector: forecast (green_win scalars) + context (8 scalars) chunked into JOB_FEATURES-wide rows
+          (no repeated scalars per slot)
+        """
+        # 1) Queue segment (7 features/entry)
         self.job_queue.sort(key=lambda job: self.fcfs_score(job))
-
-        self.running_jobs.sort(key=lambda running_job: (running_job.scheduled_time + running_job.request_time))
         self.pairs = [
-                         [
-                             job,
-                             min(float(self.current_timestamp - job.submit_time) / float(MAX_WAIT_TIME), 1.0 - 1e-5),
-                             min(float(job.request_time) / float(self.loads.max_exec_time), 1.0 - 1e-5),
-                             min(float(job.request_number_of_processors) / float(self.loads.max_procs), 1.0 - 1e-5),
-                             min(float(job.power) / float(MAX_POWER), 1.0 - 1e-5),
-                             min(float(job.power / job.request_number_of_processors) / float(MAX_perProcPower),
-                                 1.0 - 1e-5),
-                             float(job.carbon_consideration),  # Already normalized 0-1
-                             1.0 - 1e-5 if self.cluster.can_allocated(job) else 1e-5
-                         ]
-                         for i, job in enumerate(self.job_queue)
-                         if i < MAX_QUEUE_SIZE
-                     ] + [
-                         [None, 0, 1, 1, 1, 1, 0.5, 0]  # Updated padding for 7 features
-                         for _ in range(MAX_QUEUE_SIZE - len(self.job_queue))
-                     ]
-
-        vector[:MAX_QUEUE_SIZE * JOB_FEATURES] = [item for pair in self.pairs[:MAX_QUEUE_SIZE] for item in pair[1:]]
-
-        running_job = [
-                          [
-                              min(float(temp_job.request_number_of_processors) / float(self.loads.max_procs),
-                                  1.0 - 1e-5),
-                              min(float(temp_job.power) / float(MAX_POWER), 1.0 - 1e-5),
-                              min(float(temp_job.power / temp_job.request_number_of_processors) / float(
-                                  MAX_perProcPower), 1.0 - 1e-5),
-                              min(float(temp_job.scheduled_time + temp_job.request_time - self.current_timestamp) / float(
-                                  self.loads.max_exec_time), 1.0 - 1e-5),
-                              float(temp_job.carbon_consideration),  # Carbon consideration (0-1)
-                              0, 0  # Padding to make it 7 features
-                          ]
-                          for i, temp_job in enumerate(self.running_jobs[:run_win])
-                          if i < run_win
-                      ] + [
-                          [0, 0, 0, 0, 0.5, 0, 0]  # 7 features for padding
-                          for _ in range(run_win - len(self.running_jobs))
-                      ]
-        vector[MAX_QUEUE_SIZE * JOB_FEATURES:(MAX_QUEUE_SIZE + run_win) * JOB_FEATURES] = [
-            job_feature for job in running_job for job_feature in job
-        ]
-
-
-
-        green = self.cluster.carbonIntensity.getCarbonIntensitySlot(self.current_timestamp)
-        carbon_slot = [
             [
-                min(float(carbonSlot['lastTime']) / float(self.loads.max_exec_time), 1.0 - 1e-5),
-                min(float(carbonSlot['carbonIntensity']) / MAX_CARBON_INTENSITY, 1.0 - 1e-5),  # Normalize by max carbon intensity
-                0, 0, 0, 0, 0  # Padding to make it 7 features
+                job,
+                min(float(self.current_timestamp - job.submit_time) / float(MAX_WAIT_TIME), 1.0 - 1e-5),
+                min(float(job.request_time) / float(self.loads.max_exec_time), 1.0 - 1e-5),
+                min(float(job.request_number_of_processors) / float(self.loads.max_procs), 1.0 - 1e-5),
+                min(float(job.power) / float(MAX_POWER), 1.0 - 1e-5),
+                min(float(job.power / job.request_number_of_processors) / float(MAX_perProcPower), 1.0 - 1e-5),
+                float(job.carbon_consideration),  # 0-1
+                1.0 - 1e-5 if self.cluster.can_allocated(job) else 1e-5
             ]
-            for carbonSlot in green
+            for i, job in enumerate(self.job_queue)
+            if i < MAX_QUEUE_SIZE
+        ] + [
+            [None, 0, 1, 1, 1, 1, 0.5, 0]
+            for _ in range(MAX_QUEUE_SIZE - len(self.job_queue))
         ]
+        queue_feat = [item for pair in self.pairs[:MAX_QUEUE_SIZE] for item in pair[1:]]  # 7 * MAX_QUEUE_SIZE
 
-        start_index = MAX_QUEUE_SIZE + run_win
-        end_index = MAX_QUEUE_SIZE + run_win + green_win
-        vector[start_index * JOB_FEATURES:end_index * JOB_FEATURES] = [item for slot in carbon_slot[
-                                                                                        start_index - MAX_QUEUE_SIZE - run_win:end_index - MAX_QUEUE_SIZE - run_win]
-                                                                       for item in slot]
+        # 2) Running segment (RUN_FEATURE per entry): [remaining_time_norm, per_proc_power_norm]
+        self.running_jobs.sort(key=lambda running_job: (running_job.scheduled_time + running_job.request_time))
+        def run_feats(j):
+            remaining = max(0.0, (j.scheduled_time + j.request_time - self.current_timestamp))
+            remaining_norm = min(remaining / float(self.loads.max_exec_time), 1.0 - 1e-5)
+            per_proc = (j.power / max(1, j.request_number_of_processors))
+            per_proc_norm = min(per_proc / float(MAX_perProcPower), 1.0 - 1e-5)
+            return [remaining_norm, per_proc_norm]
 
+        running_feat = []
+        for i in range(run_win):
+            if i < len(self.running_jobs):
+                running_feat.extend(run_feats(self.running_jobs[i]))
+            else:
+                running_feat.extend([0.0, 0.0])  # padding for RUN_FEATURE=2
+
+        # 3) Green unified vector: forecast (green_win) + context (8)
+        green_slots = self.cluster.carbonIntensity.getCarbonIntensitySlot(self.current_timestamp)
+        # Forecast scalars (normalized intensities)
+        forecast = []
+        for i in range(green_win):
+            if i < len(green_slots):
+                ci = float(green_slots[i]['carbonIntensity'])
+                forecast.append(min(ci / MAX_CARBON_INTENSITY, 1.0 - 1e-5))
+            else:
+                forecast.append(0.0)
+
+        # Current CI scalar and time-left
+        if len(green_slots) > 0:
+            current_ci_norm = min(float(green_slots[0]['carbonIntensity']) / MAX_CARBON_INTENSITY, 1.0 - 1e-5)
+            time_left_sec = max(0.0, float(green_slots[0]['lastTime']) - float(self.current_timestamp))
+            time_left_norm = min(time_left_sec / 3600.0, 1.0 - 1e-5)
+        else:
+            current_ci_norm = 0.0
+            time_left_norm = 0.0
+
+        # Cyclical encodings based on episode offset and current time
+        start_offset = getattr(self.cluster.carbonIntensity, 'start_offset', 0)
+        total_hours = int(start_offset + (self.current_timestamp // 3600))
+        hour_of_day = total_hours % 24
+        day_of_week = (total_hours // 24) % 7
+        hour_of_year = total_hours % (365 * 24)
+
+        two_pi = 2.0 * math.pi
+        hour_sin = math.sin(two_pi * hour_of_day / 24.0)
+        hour_cos = math.cos(two_pi * hour_of_day / 24.0)
+        day_sin = math.sin(two_pi * day_of_week / 7.0)
+        day_cos = math.cos(two_pi * day_of_week / 7.0)
+        year_sin = math.sin(two_pi * hour_of_year / (365.0 * 24.0))
+        year_cos = math.cos(two_pi * hour_of_year / (365.0 * 24.0))
+
+        # Context8: [current_ci_norm, hour_sin, hour_cos, day_sin, day_cos, year_sin, year_cos, time_left_norm]
+        context8 = [current_ci_norm, hour_sin, hour_cos, day_sin, day_cos, year_sin, year_cos, time_left_norm]
+
+        unified_green = forecast + context8  # length = green_win + 8 (no padding)
+        # Concatenate all segments
+        vector = np.array(queue_feat + running_feat + unified_green, dtype=float)
         return vector
 
     # @profile
@@ -1611,4 +1637,3 @@ class HPCEnv(gym.Env):
         carbonRwd = self.cluster.carbonIntensity.getCarbonAwareReward(scheduledJobs)
 
         return rwd1,carbonRwd
-
