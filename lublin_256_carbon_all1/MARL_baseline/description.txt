@@ -1,4 +1,4 @@
 Experiment: MARL_baseline
-Workload: lublin_256
-Timestamp: 2025-08-15T15:56:57.869855
+Workload: lublin_256_carbon_all1
+Timestamp: 2025-08-15T15:57:22.904875
 Description: Baseline MARL without backfilling

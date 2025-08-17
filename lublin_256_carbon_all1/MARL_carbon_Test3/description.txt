@@ -1,0 +1,4 @@
+Experiment: MARL_carbon_Test3
+Workload: lublin_256_carbon_all1
+Timestamp: 2025-08-15T16:54:27.052847
+Description: Carbon only test with updated setup
